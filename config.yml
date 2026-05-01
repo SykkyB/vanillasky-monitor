@@ -1,0 +1,9 @@
+poll_interval_seconds: 300
+min_days_ahead: 10
+lookahead_days: 45
+
+routes:
+  - { from: Natakhtari, to: Mestia }
+  - { from: Mestia,     to: Natakhtari }
+  - { from: Natakhtari, to: Batumi }
+  - { from: Batumi,     to: Natakhtari }
