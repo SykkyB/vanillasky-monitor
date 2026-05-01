@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date
 
 import httpx
@@ -13,24 +14,36 @@ TG_API = "https://api.telegram.org"
 BOOK_URL = "https://ticket.vanillasky.ge/en/tickets"
 
 
+@dataclass(frozen=True)
+class ReleasedFlight:
+    flight_date: str  # ISO YYYY-MM-DD
+    flight_time: str | None
+    price: str | None
+
+
 def _format_date(iso: str) -> str:
-    """ISO 'YYYY-MM-DD' → display 'DD-Month-YYYY' (e.g. '12-May-2026')."""
     try:
         return date.fromisoformat(iso).strftime("%d-%B-%Y")
     except ValueError:
         return iso
 
 
-def _format_message(route: Route, new_dates: list[str], passenger_count: int) -> str:
-    """The Drupal booking form ignores query params, so we don't deep-link
-    individual dates. We give the user the dates to copy into the form."""
+def _format_message(
+    route: Route, flights: list[ReleasedFlight], passenger_count: int
+) -> str:
+    pax_word = "passenger" if passenger_count == 1 else "passengers"
     lines = [
-        f"✈️ *{route.from_name} → {route.to_name}* — new dates available!",
+        f"🎫 *{route.from_name} → {route.to_name}* — TICKETS RELEASED!",
         "",
-        f"For {passenger_count} passenger{'s' if passenger_count != 1 else ''}:",
+        f"For *{passenger_count}* {pax_word}:",
     ]
-    for d in new_dates:
-        lines.append(f"• `{_format_date(d)}`")
+    for f in flights:
+        bits = [f"`{_format_date(f.flight_date)}`"]
+        if f.flight_time:
+            bits.append(f.flight_time)
+        if f.price:
+            bits.append(f.price)
+        lines.append("• " + " — ".join(bits))
     lines.append("")
     lines.append(f"👉 [Open booking page]({BOOK_URL})")
     lines.append(f"Pick *{route.from_name} → {route.to_name}* and one of the dates above.")
@@ -42,10 +55,10 @@ async def send_alert(
     bot_token: str,
     chat_id: str,
     route: Route,
-    new_dates: list[str],
+    flights: list[ReleasedFlight],
     passenger_count: int,
 ) -> None:
-    text = _format_message(route, new_dates, passenger_count)
+    text = _format_message(route, flights, passenger_count)
     url = f"{TG_API}/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -58,6 +71,6 @@ async def send_alert(
         if resp.status_code != 200:
             log.error("Telegram error %s: %s", resp.status_code, resp.text[:300])
         else:
-            log.info("[%s] alerted %d new dates", route.key, len(new_dates))
+            log.info("[%s] alerted %d new released flights", route.key, len(flights))
     except httpx.HTTPError as e:
         log.error("Telegram request failed: %s", e)

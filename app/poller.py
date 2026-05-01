@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Any
 
 import httpx
 
@@ -11,40 +12,24 @@ from .config import Route
 log = logging.getLogger(__name__)
 
 API_BASE = "https://ticket.vanillasky.ge"
+TICKETS_URL = f"{API_BASE}/en/tickets"
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
+_FORM_BUILD_ID_RE = re.compile(r'name="form_build_id" value="([^"]+)"')
+_PRICE_RE = re.compile(r"(\d+)\s*GEL", re.IGNORECASE)
+_TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
+_NO_TICKETS_MARKER = "There are no available tickets"
+_BOOKABLE_MARKER = "Choose Flight"
 
-def _normalize_date(item: Any) -> str | None:
-    """Vanilla Sky's API shape isn't documented; coerce a few likely formats to YYYY-MM-DD."""
-    if item is None:
-        return None
-    if isinstance(item, (int, float)):
-        ts = int(item)
-        if ts > 10_000_000_000:  # ms
-            ts //= 1000
-        return datetime.utcfromtimestamp(ts).date().isoformat()
-    if isinstance(item, str):
-        s = item.strip()
-        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%Y", "%Y/%m/%d"):
-            try:
-                return datetime.strptime(s, fmt).date().isoformat()
-            except ValueError:
-                continue
-        if s.isdigit():
-            return _normalize_date(int(s))
-        log.warning("Unrecognised date string from API: %r", s)
-        return None
-    if isinstance(item, dict):
-        for key in ("date", "day", "flight_date", "value"):
-            if key in item:
-                return _normalize_date(item[key])
-        log.warning("Unrecognised date object from API: %r", item)
-        return None
-    log.warning("Unrecognised date payload type: %r", item)
-    return None
+
+@dataclass(frozen=True)
+class BookableResult:
+    bookable: bool
+    price: str | None = None
+    flight_time: str | None = None
 
 
 def _filter_window(dates: list[str], min_days_ahead: int, lookahead_days: int) -> list[str]:
@@ -62,40 +47,121 @@ def _filter_window(dates: list[str], min_days_ahead: int, lookahead_days: int) -
     return sorted(set(out))
 
 
-async def fetch_route(client: httpx.AsyncClient, route: Route) -> list[str]:
-    """Hit /custom/check-flight/{from}/{to} and return outbound flight dates (YYYY-MM-DD)."""
+async def fetch_form_build_id(client: httpx.AsyncClient) -> str:
+    resp = await client.get(TICKETS_URL, timeout=20.0)
+    resp.raise_for_status()
+    m = _FORM_BUILD_ID_RE.search(resp.text)
+    if not m:
+        raise RuntimeError("form_build_id not found on /en/tickets")
+    return m.group(1)
+
+
+async def fetch_schedule(client: httpx.AsyncClient, route: Route) -> list[str]:
+    """GET /custom/check-flight/{from}/{to} — returns flight schedule (days the
+    plane flies). Does NOT mean tickets are on sale; only POST tells you that."""
     url = f"{API_BASE}/custom/check-flight/{route.from_id}/{route.to_id}"
     try:
         resp = await client.get(url, timeout=20.0)
         resp.raise_for_status()
-    except httpx.HTTPError as e:
-        log.warning("[%s] fetch failed: %s", route.key, e)
-        return []
-
-    try:
         data = resp.json()
-    except ValueError:
-        log.warning("[%s] non-JSON response: %s", route.key, resp.text[:200])
+    except (httpx.HTTPError, ValueError) as e:
+        log.warning("[%s] schedule fetch failed: %s", route.key, e)
         return []
 
-    raw_from = data.get("from", []) if isinstance(data, dict) else []
-    if raw_from:
-        log.info("[%s] raw 'from' payload: %r", route.key, raw_from)
-
+    raw = data.get("from", []) if isinstance(data, dict) else []
     dates: list[str] = []
-    for item in raw_from:
-        nd = _normalize_date(item)
-        if nd:
-            dates.append(nd)
+    for item in raw:
+        if isinstance(item, str):
+            try:
+                datetime.strptime(item, "%Y-%m-%d")
+                dates.append(item)
+            except ValueError:
+                log.warning("[%s] non-ISO date in schedule: %r", route.key, item)
     return sorted(set(dates))
+
+
+async def check_bookable(
+    client: httpx.AsyncClient,
+    form_build_id: str,
+    route: Route,
+    flight_date_iso: str,
+    passenger_count: int,
+) -> BookableResult:
+    """POST the booking form to find out whether tickets are actually on sale
+    for this date and number of passengers. Parses Vanilla Sky's HTML response."""
+    display_date = date.fromisoformat(flight_date_iso).strftime("%d %b %Y")
+    payload = [
+        ("departure", str(route.from_id)),
+        ("arrive", str(route.to_id)),
+        ("types", "0"),  # one-way
+        ("date_picker", display_date),
+        ("date_picker_arrive", ""),
+        ("person_count", str(passenger_count)),
+        ("person_types[adult]", str(passenger_count)),
+        ("person_types[child]", "0"),
+        ("person_types[infant]", "0"),
+        ("op", ""),
+        ("form_build_id", form_build_id),
+        ("form_id", "form_select_date"),
+    ]
+    try:
+        resp = await client.post(
+            TICKETS_URL,
+            data=payload,
+            timeout=30.0,
+            follow_redirects=True,
+            headers={"Referer": TICKETS_URL},
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        log.warning("[%s] %s POST failed: %s", route.key, flight_date_iso, e)
+        return BookableResult(bookable=False)
+
+    html = resp.text
+    if _NO_TICKETS_MARKER in html:
+        return BookableResult(bookable=False)
+
+    if _BOOKABLE_MARKER not in html:
+        # Unknown page — log a fingerprint and treat as not bookable so we don't
+        # spam alerts on weird pages (e.g. site maintenance).
+        log.warning(
+            "[%s] %s: unexpected response (size=%d, has 'flight'=%s)",
+            route.key,
+            flight_date_iso,
+            len(html),
+            "flight" in html.lower(),
+        )
+        return BookableResult(bookable=False)
+
+    # We're on the "Choose Flight" results page. Extract first time + price.
+    # Parse only the flight-items block, not the whole page (avoids false
+    # matches in headers/footers).
+    flight_block = html
+    block_match = re.search(
+        r'<div class="flight-items-bl"[^>]*>(.*?)<div class="flight-page-content"|'
+        r'<div class="flight-items-bl"[^>]*>(.*?)</form>',
+        html,
+        re.S,
+    )
+    if block_match:
+        flight_block = block_match.group(1) or block_match.group(2) or html
+
+    time_match = _TIME_RE.search(flight_block)
+    price_match = _PRICE_RE.search(flight_block)
+
+    flight_time = (
+        f"{int(time_match.group(1)):02d}:{time_match.group(2)}" if time_match else None
+    )
+    price = f"{price_match.group(1)} GEL" if price_match else None
+    return BookableResult(bookable=True, price=price, flight_time=flight_time)
 
 
 def make_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         headers={
             "User-Agent": USER_AGENT,
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Referer": f"{API_BASE}/en/tickets",
-        }
+            "Accept": "text/html,application/xhtml+xml,application/xml,application/json;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        cookies=httpx.Cookies(),
     )

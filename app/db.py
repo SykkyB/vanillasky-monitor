@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS seen_dates (
+-- Old tables from schedule-only era. Drop on first run after the migration.
+DROP TABLE IF EXISTS seen_dates;
+DROP TABLE IF EXISTS events;
+
+-- Schedule snapshots: when did we first/last see a flight day in the API.
+CREATE TABLE IF NOT EXISTS schedule_dates (
     route_key   TEXT NOT NULL,
     flight_date TEXT NOT NULL,
     first_seen  INTEGER NOT NULL,
@@ -14,15 +19,41 @@ CREATE TABLE IF NOT EXISTS seen_dates (
     PRIMARY KEY (route_key, flight_date)
 );
 
-CREATE TABLE IF NOT EXISTS events (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts         INTEGER NOT NULL,
-    route_key  TEXT NOT NULL,
-    new_dates  TEXT NOT NULL
+-- Real "is the ticket buyable for N passengers" state per (route, date).
+CREATE TABLE IF NOT EXISTS bookable_state (
+    route_key       TEXT NOT NULL,
+    flight_date     TEXT NOT NULL,
+    bookable        INTEGER NOT NULL,
+    price           TEXT,
+    flight_time     TEXT,
+    passenger_count INTEGER NOT NULL,
+    last_check      INTEGER NOT NULL,
+    PRIMARY KEY (route_key, flight_date, passenger_count)
 );
 
-CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+-- Transition history (released / sold_out). Drives the "actually a release"
+-- pattern analysis later on.
+CREATE TABLE IF NOT EXISTS bookable_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              INTEGER NOT NULL,
+    route_key       TEXT NOT NULL,
+    flight_date     TEXT NOT NULL,
+    transition      TEXT NOT NULL,
+    price           TEXT,
+    flight_time     TEXT,
+    passenger_count INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bookable_events_ts ON bookable_events(ts);
 """
+
+
+@dataclass(frozen=True)
+class BookableState:
+    bookable: bool
+    price: str | None
+    flight_time: str | None
+    last_check: int
 
 
 class DB:
@@ -34,31 +65,65 @@ class DB:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
 
-    def known_dates(self, route_key: str) -> set[str]:
-        cur = self.conn.execute(
-            "SELECT flight_date FROM seen_dates WHERE route_key = ?", (route_key,)
-        )
-        return {row[0] for row in cur.fetchall()}
-
-    def record_dates(self, route_key: str, dates: list[str]) -> list[str]:
-        """Insert/update seen dates. Return the list of dates that are new."""
+    def record_schedule(self, route_key: str, dates: list[str]) -> None:
         if not dates:
-            return []
+            return
         now = int(time.time())
-        known = self.known_dates(route_key)
-        new = [d for d in dates if d not in known]
-
         with self.conn:
             for d in dates:
                 self.conn.execute(
-                    """INSERT INTO seen_dates(route_key, flight_date, first_seen, last_seen)
+                    """INSERT INTO schedule_dates(route_key, flight_date, first_seen, last_seen)
                        VALUES (?, ?, ?, ?)
                        ON CONFLICT(route_key, flight_date) DO UPDATE SET last_seen = excluded.last_seen""",
                     (route_key, d, now, now),
                 )
-            if new:
+
+    def get_bookable_state(
+        self, route_key: str, flight_date: str, passenger_count: int
+    ) -> BookableState | None:
+        cur = self.conn.execute(
+            """SELECT bookable, price, flight_time, last_check
+               FROM bookable_state
+               WHERE route_key = ? AND flight_date = ? AND passenger_count = ?""",
+            (route_key, flight_date, passenger_count),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return BookableState(
+            bookable=bool(row[0]),
+            price=row[1],
+            flight_time=row[2],
+            last_check=row[3],
+        )
+
+    def update_bookable_state(
+        self,
+        route_key: str,
+        flight_date: str,
+        passenger_count: int,
+        bookable: bool,
+        price: str | None,
+        flight_time: str | None,
+        transition: str | None,
+    ) -> None:
+        now = int(time.time())
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO bookable_state(route_key, flight_date, bookable,
+                       price, flight_time, passenger_count, last_check)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(route_key, flight_date, passenger_count) DO UPDATE SET
+                       bookable    = excluded.bookable,
+                       price       = excluded.price,
+                       flight_time = excluded.flight_time,
+                       last_check  = excluded.last_check""",
+                (route_key, flight_date, int(bookable), price, flight_time, passenger_count, now),
+            )
+            if transition:
                 self.conn.execute(
-                    "INSERT INTO events(ts, route_key, new_dates) VALUES (?, ?, ?)",
-                    (now, route_key, json.dumps(new)),
+                    """INSERT INTO bookable_events(ts, route_key, flight_date, transition,
+                           price, flight_time, passenger_count)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (now, route_key, flight_date, transition, price, flight_time, passenger_count),
                 )
-        return new
