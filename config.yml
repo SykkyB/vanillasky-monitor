@@ -1,6 +1,7 @@
 poll_interval_seconds: 300
 min_days_ahead: 10
 lookahead_days: 45
+passenger_count: 2
 
 routes:
   - { from: Natakhtari, to: Mestia }

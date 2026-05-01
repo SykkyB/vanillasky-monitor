@@ -41,6 +41,7 @@ class Settings:
     poll_interval_seconds: int
     min_days_ahead: int
     lookahead_days: int
+    passenger_count: int
     routes: tuple[Route, ...]
     bot_token: str
     chat_id: str
@@ -66,6 +67,7 @@ def load(config_path: str | Path = "config.yml") -> Settings:
         poll_interval_seconds=int(raw.get("poll_interval_seconds", 300)),
         min_days_ahead=int(raw.get("min_days_ahead", 10)),
         lookahead_days=int(raw.get("lookahead_days", 45)),
+        passenger_count=int(raw.get("passenger_count", 2)),
         routes=tuple(routes),
         bot_token=bot_token,
         chat_id=chat_id,

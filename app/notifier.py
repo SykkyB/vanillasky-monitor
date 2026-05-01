@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import date
 
 import httpx
 
@@ -12,16 +13,24 @@ TG_API = "https://api.telegram.org"
 BOOK_URL = "https://ticket.vanillasky.ge/en/tickets"
 
 
-def _format_message(route: Route, new_dates: list[str]) -> str:
+def _format_date(iso: str) -> str:
+    """ISO 'YYYY-MM-DD' → display 'DD-Month-YYYY' (e.g. '12-May-2026')."""
+    try:
+        return date.fromisoformat(iso).strftime("%d-%B-%Y")
+    except ValueError:
+        return iso
+
+
+def _format_message(route: Route, new_dates: list[str], passenger_count: int) -> str:
     """The Drupal booking form ignores query params, so we don't deep-link
     individual dates. We give the user the dates to copy into the form."""
     lines = [
         f"✈️ *{route.from_name} → {route.to_name}* — new dates available!",
         "",
-        "Available dates:",
+        f"For {passenger_count} passenger{'s' if passenger_count != 1 else ''}:",
     ]
     for d in new_dates:
-        lines.append(f"• `{d}`")
+        lines.append(f"• `{_format_date(d)}`")
     lines.append("")
     lines.append(f"👉 [Open booking page]({BOOK_URL})")
     lines.append(f"Pick *{route.from_name} → {route.to_name}* and one of the dates above.")
@@ -29,9 +38,14 @@ def _format_message(route: Route, new_dates: list[str]) -> str:
 
 
 async def send_alert(
-    client: httpx.AsyncClient, bot_token: str, chat_id: str, route: Route, new_dates: list[str]
+    client: httpx.AsyncClient,
+    bot_token: str,
+    chat_id: str,
+    route: Route,
+    new_dates: list[str],
+    passenger_count: int,
 ) -> None:
-    text = _format_message(route, new_dates)
+    text = _format_message(route, new_dates, passenger_count)
     url = f"{TG_API}/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,

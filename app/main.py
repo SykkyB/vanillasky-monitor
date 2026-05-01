@@ -48,7 +48,14 @@ async def run_one_cycle(
         new = db.record_dates(route.key, in_window)
         if new:
             log.info("[%s] %d NEW dates: %s", route.key, len(new), new)
-            await send_alert(tg_client, settings.bot_token, settings.chat_id, route, new)
+            await send_alert(
+                tg_client,
+                settings.bot_token,
+                settings.chat_id,
+                route,
+                new,
+                settings.passenger_count,
+            )
         else:
             log.info("[%s] %d dates available, all already known", route.key, len(in_window))
 
@@ -61,11 +68,12 @@ async def main() -> None:
 
     settings = load("/app/config.yml")
     log.info(
-        "Started. routes=%d, interval=%ss, window=[+%dd .. +%dd]",
+        "Started. routes=%d, interval=%ss, window=[+%dd .. +%dd], passengers=%d",
         len(settings.routes),
         settings.poll_interval_seconds,
         settings.min_days_ahead,
         settings.lookahead_days,
+        settings.passenger_count,
     )
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
