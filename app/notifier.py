@@ -12,18 +12,19 @@ TG_API = "https://api.telegram.org"
 BOOK_URL = "https://ticket.vanillasky.ge/en/tickets"
 
 
-def _booking_link(route: Route, flight_date: str) -> str:
-    return (
-        f"{BOOK_URL}?departure={route.from_id}&arrive={route.to_id}"
-        f"&date_picker={flight_date}"
-    )
-
-
 def _format_message(route: Route, new_dates: list[str]) -> str:
-    lines = [f"✈️ *{route.from_name} → {route.to_name}* — new dates available!"]
+    """The Drupal booking form ignores query params, so we don't deep-link
+    individual dates. We give the user the dates to copy into the form."""
+    lines = [
+        f"✈️ *{route.from_name} → {route.to_name}* — new dates available!",
+        "",
+        "Available dates:",
+    ]
     for d in new_dates:
-        lines.append(f"• [{d}]({_booking_link(route, d)})")
-    lines.append(f"\n[Open booking page]({BOOK_URL})")
+        lines.append(f"• `{d}`")
+    lines.append("")
+    lines.append(f"👉 [Open booking page]({BOOK_URL})")
+    lines.append(f"Pick *{route.from_name} → {route.to_name}* and one of the dates above.")
     return "\n".join(lines)
 
 
