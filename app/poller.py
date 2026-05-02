@@ -4,6 +4,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from urllib.parse import urlencode
 
 import httpx
 
@@ -104,13 +105,17 @@ async def check_bookable(
         ("form_build_id", form_build_id),
         ("form_id", "form_select_date"),
     ]
+    body = urlencode(payload).encode("utf-8")
     try:
         resp = await client.post(
             TICKETS_URL,
-            data=payload,
+            content=body,
             timeout=30.0,
             follow_redirects=True,
-            headers={"Referer": TICKETS_URL},
+            headers={
+                "Referer": TICKETS_URL,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
         )
         resp.raise_for_status()
     except httpx.HTTPError as e:
@@ -163,5 +168,4 @@ def make_client() -> httpx.AsyncClient:
             "Accept": "text/html,application/xhtml+xml,application/xml,application/json;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         },
-        cookies=httpx.Cookies(),
     )
