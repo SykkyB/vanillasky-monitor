@@ -3,26 +3,34 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import httpx
 
-from .config import CITY_IDS, Route, Settings
-from .poller import check_bookable, fetch_form_build_id
+from .config import CITY_IDS, CITY_NAMES, Route, Settings
+from .poller import API_BASE, check_bookable, fetch_form_build_id
 
 log = logging.getLogger(__name__)
 
 TG_API = "https://api.telegram.org"
 OFFSET_FILE = Path("/app/data/bot_offset.json")
-LONG_POLL_TIMEOUT = 25  # seconds the server will hold the request
+LONG_POLL_TIMEOUT = 25
+POST_RATE_LIMIT_SEC = 0.5
+DATE_FORMATS = ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d.%m.%Y")
 
 HELP_TEXT = (
-    "*Vanilla Sky monitor — commands*\n\n"
-    "`/check FROM TO YYYY-MM-DD PAX` — check tickets right now\n\n"
-    "Example:\n"
-    "`/check Natakhtari Mestia 2026-05-15 3`\n\n"
-    "Cities: Tbilisi, Ambrolauri, Batumi, Kutaisi, Mestia, Natakhtari"
+    "*Vanilla Sky monitor*\n\n"
+    "`/check FROM TO DATE [PAX]` — check a specific route\n"
+    "`/check FROM DATE [PAX]` — scan all destinations from FROM\n\n"
+    "DATE: `DD-MM-YYYY` or `DD/MM/YYYY` (e.g. `31-05-2026`, `31/05/2026`)\n"
+    "PAX: 1–9, defaults to 1\n\n"
+    "Cities: Tbilisi, Ambrolauri, Batumi, Kutaisi, Mestia, Natakhtari\n"
+    "(prefixes work: `Nat`, `Mes`, `B`, etc.)\n\n"
+    "Examples:\n"
+    "`/check Natakhtari Mestia 31-05-2026`\n"
+    "`/check Mes 31/05/2026 3`\n"
+    "`/check Natakhtari 31-05-2026`"
 )
 
 
@@ -36,6 +44,35 @@ def _load_offset() -> int:
 def _save_offset(offset: int) -> None:
     OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
     OFFSET_FILE.write_text(json.dumps({"offset": offset}))
+
+
+def _parse_date(s: str) -> date | None:
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _resolve_city(arg: str) -> str | None:
+    """Case-insensitive exact or unambiguous-prefix match against city list."""
+    if not arg:
+        return None
+    al = arg.lower()
+    exact = [k for k in CITY_IDS if k.lower() == al]
+    if exact:
+        return exact[0]
+    prefix = [k for k in CITY_IDS if k.lower().startswith(al)]
+    return prefix[0] if len(prefix) == 1 else None
+
+
+def _parse_pax(s: str) -> int | None:
+    try:
+        n = int(s)
+    except ValueError:
+        return None
+    return n if 1 <= n <= 9 else None
 
 
 async def _tg_send(
@@ -56,80 +93,34 @@ async def _tg_send(
         log.error("Telegram send failed: %s", e)
 
 
-async def _handle_check(
+async def _check_one_route(
     settings: Settings,
     vs_client: httpx.AsyncClient,
     tg_client: httpx.AsyncClient,
     chat_id: int,
-    args: list[str],
+    from_canonical: str,
+    to_canonical: str,
+    flight_date: date,
+    pax: int,
 ) -> None:
-    if len(args) != 4:
-        await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
-        return
-
-    from_arg, to_arg, date_str, pax_str = args
-
-    cities_lower = {k.lower(): k for k in CITY_IDS}
-    from_canonical = cities_lower.get(from_arg.lower())
-    to_canonical = cities_lower.get(to_arg.lower())
-    if not from_canonical or not to_canonical:
-        await _tg_send(
-            tg_client,
-            settings.bot_token,
-            chat_id,
-            f"❌ Unknown city. Known: {', '.join(CITY_IDS)}",
-        )
-        return
     if from_canonical == to_canonical:
         await _tg_send(tg_client, settings.bot_token, chat_id, "❌ FROM and TO must differ")
         return
 
-    try:
-        flight_date = date.fromisoformat(date_str)
-    except ValueError:
-        await _tg_send(
-            tg_client,
-            settings.bot_token,
-            chat_id,
-            f"❌ Bad date `{date_str}` — use YYYY-MM-DD",
-        )
-        return
-
-    if flight_date < date.today():
-        await _tg_send(tg_client, settings.bot_token, chat_id, "❌ Date is in the past")
-        return
-
-    try:
-        pax = int(pax_str)
-        if pax < 1 or pax > 9:
-            raise ValueError
-    except ValueError:
-        await _tg_send(tg_client, settings.bot_token, chat_id, "❌ PAX must be 1-9")
-        return
-
     route = Route(from_name=from_canonical, to_name=to_canonical)
+    iso = flight_date.isoformat()
 
-    log.info(
-        "[/check] %s -> %s on %s for %d pax (chat=%s)",
-        from_canonical,
-        to_canonical,
-        date_str,
-        pax,
-        chat_id,
-    )
+    log.info("[/check] %s -> %s on %s for %d pax", from_canonical, to_canonical, iso, pax)
 
     try:
         form_build_id = await fetch_form_build_id(vs_client)
     except Exception as e:
         await _tg_send(
-            tg_client,
-            settings.bot_token,
-            chat_id,
-            f"❌ Couldn't get form ID: `{e}`",
+            tg_client, settings.bot_token, chat_id, f"❌ Couldn't get form ID: `{e}`"
         )
         return
 
-    result = await check_bookable(vs_client, form_build_id, route, date_str, pax)
+    result = await check_bookable(vs_client, form_build_id, route, iso, pax)
 
     display_date = flight_date.strftime("%d-%B-%Y")
     pax_word = "passenger" if pax == 1 else "passengers"
@@ -150,8 +141,166 @@ async def _handle_check(
             f"❌ *{from_canonical} → {to_canonical}* — `{display_date}`\n"
             f"No tickets for *{pax}* {pax_word}."
         )
+    await _tg_send(tg_client, settings.bot_token, chat_id, msg)
+
+
+async def _scan_destinations(
+    settings: Settings,
+    vs_client: httpx.AsyncClient,
+    tg_client: httpx.AsyncClient,
+    chat_id: int,
+    from_canonical: str,
+    flight_date: date,
+    pax: int,
+) -> None:
+    iso = flight_date.isoformat()
+    from_id = CITY_IDS[from_canonical]
+
+    log.info("[/check scan] %s on %s for %d pax", from_canonical, iso, pax)
+
+    try:
+        resp = await vs_client.get(
+            f"{API_BASE}/custom/check-dest/{from_id}", timeout=20.0
+        )
+        resp.raise_for_status()
+        dest_ids = resp.json()
+    except (httpx.HTTPError, ValueError) as e:
+        await _tg_send(
+            tg_client, settings.bot_token, chat_id, f"❌ Couldn't list destinations: `{e}`"
+        )
+        return
+
+    dest_names = [CITY_NAMES[d] for d in dest_ids if d in CITY_NAMES]
+    if not dest_names:
+        await _tg_send(
+            tg_client,
+            settings.bot_token,
+            chat_id,
+            f"No flights configured from *{from_canonical}*",
+        )
+        return
+
+    try:
+        form_build_id = await fetch_form_build_id(vs_client)
+    except Exception as e:
+        await _tg_send(
+            tg_client, settings.bot_token, chat_id, f"❌ Couldn't get form ID: `{e}`"
+        )
+        return
+
+    available: list[tuple[str, str | None, str | None]] = []
+    for dest in dest_names:
+        route = Route(from_name=from_canonical, to_name=dest)
+        result = await check_bookable(vs_client, form_build_id, route, iso, pax)
+        if result.bookable:
+            available.append((dest, result.flight_time, result.price))
+        await asyncio.sleep(POST_RATE_LIMIT_SEC)
+
+    display_date = flight_date.strftime("%d-%B-%Y")
+    pax_word = "passenger" if pax == 1 else "passengers"
+
+    if not available:
+        checked = ", ".join(dest_names)
+        msg = (
+            f"❌ No tickets from *{from_canonical}* on `{display_date}` "
+            f"for *{pax}* {pax_word}\n\n"
+            f"Checked: {checked}"
+        )
+    else:
+        lines = [
+            f"✅ From *{from_canonical}* on `{display_date}` for *{pax}* {pax_word}:",
+            "",
+        ]
+        for dest, ftime, price in available:
+            bits = [f"→ *{dest}*"]
+            if ftime:
+                bits.append(f"🕒 {ftime}")
+            if price:
+                bits.append(f"💰 {price}")
+            lines.append("• " + " — ".join(bits))
+        lines.append("\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)")
+        msg = "\n".join(lines)
 
     await _tg_send(tg_client, settings.bot_token, chat_id, msg)
+
+
+async def _handle_check(
+    settings: Settings,
+    vs_client: httpx.AsyncClient,
+    tg_client: httpx.AsyncClient,
+    chat_id: int,
+    args: list[str],
+) -> None:
+    """Dispatch:
+        4 args  → FROM TO DATE PAX
+        3 args  → FROM TO DATE (pax=1)  OR  FROM DATE PAX
+        2 args  → FROM DATE (pax=1)
+        else    → help
+    """
+    if len(args) not in (2, 3, 4):
+        await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
+        return
+
+    from_canonical = _resolve_city(args[0])
+    if not from_canonical:
+        await _tg_send(
+            tg_client,
+            settings.bot_token,
+            chat_id,
+            f"❌ Unknown FROM `{args[0]}`. Known: {', '.join(CITY_IDS)}",
+        )
+        return
+
+    if len(args) == 4:
+        to_canonical = _resolve_city(args[1])
+        flight_date = _parse_date(args[2])
+        pax = _parse_pax(args[3])
+        if not to_canonical or flight_date is None or pax is None:
+            await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
+            return
+    elif len(args) == 3:
+        # disambiguate args[1]: city or date?
+        maybe_city = _resolve_city(args[1])
+        maybe_date = _parse_date(args[1])
+        if maybe_city:
+            to_canonical = maybe_city
+            flight_date = _parse_date(args[2])
+            pax = 1
+            if flight_date is None:
+                await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
+                return
+        elif maybe_date:
+            to_canonical = None
+            flight_date = maybe_date
+            pax = _parse_pax(args[2])
+            if pax is None:
+                await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
+                return
+        else:
+            await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
+            return
+    else:  # 2 args
+        to_canonical = None
+        flight_date = _parse_date(args[1])
+        pax = 1
+        if flight_date is None:
+            await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
+            return
+
+    if flight_date < date.today():
+        await _tg_send(tg_client, settings.bot_token, chat_id, "❌ Date is in the past")
+        return
+
+    if to_canonical:
+        await _check_one_route(
+            settings, vs_client, tg_client, chat_id,
+            from_canonical, to_canonical, flight_date, pax,
+        )
+    else:
+        await _scan_destinations(
+            settings, vs_client, tg_client, chat_id,
+            from_canonical, flight_date, pax,
+        )
 
 
 async def _process_update(
@@ -184,10 +333,7 @@ async def _process_update(
         await _handle_check(settings, vs_client, tg_client, chat_id, args)
     else:
         await _tg_send(
-            tg_client,
-            settings.bot_token,
-            chat_id,
-            "Unknown command. Try /help",
+            tg_client, settings.bot_token, chat_id, "Unknown command. Try /help"
         )
 
 
