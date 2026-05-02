@@ -1,5 +1,5 @@
 poll_interval_seconds: 300
-min_days_ahead: 10
+min_days_ahead: 1
 lookahead_days: 45
 passenger_count: 2
 

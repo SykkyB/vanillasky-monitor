@@ -8,6 +8,7 @@ from pathlib import Path
 
 import httpx
 
+from .bot import run_bot
 from .config import Route, Settings, load
 from .db import DB
 from .notifier import ReleasedFlight, send_alert
@@ -33,7 +34,6 @@ def _setup_logging() -> None:
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # httpx logs each request at INFO, that's a lot — quiet it.
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
@@ -142,6 +142,28 @@ async def run_one_cycle(
     HEARTBEAT.touch()
 
 
+async def polling_loop(
+    settings: Settings,
+    db: DB,
+    vs_client: httpx.AsyncClient,
+    tg_client: httpx.AsyncClient,
+    stop: asyncio.Event,
+) -> None:
+    log = logging.getLogger("polling")
+    log.info("Polling loop started")
+    while not stop.is_set():
+        try:
+            await run_one_cycle(settings, db, vs_client, tg_client)
+        except Exception:
+            log.exception("Cycle failed")
+
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=settings.poll_interval_seconds)
+        except asyncio.TimeoutError:
+            pass
+    log.info("Polling loop stopped")
+
+
 async def main() -> None:
     _setup_logging()
     log = logging.getLogger("main")
@@ -164,17 +186,11 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
-    async with make_client() as client, httpx.AsyncClient() as tg_client:
-        while not stop.is_set():
-            try:
-                await run_one_cycle(settings, db, client, tg_client)
-            except Exception:
-                log.exception("Cycle failed")
-
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=settings.poll_interval_seconds)
-            except asyncio.TimeoutError:
-                pass
+    async with make_client() as vs_client, httpx.AsyncClient() as tg_client:
+        await asyncio.gather(
+            polling_loop(settings, db, vs_client, tg_client, stop),
+            run_bot(settings, vs_client, tg_client, stop),
+        )
 
     log.info("Shutting down")
 
