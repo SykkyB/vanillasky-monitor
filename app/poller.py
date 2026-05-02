@@ -48,6 +48,40 @@ def _filter_window(dates: list[str], min_days_ahead: int, lookahead_days: int) -
     return sorted(set(out))
 
 
+async def fetch_destinations(client: httpx.AsyncClient, origin: str) -> list[str]:
+    """GET /custom/check-dest/{from_id} — list of destination city names that
+    Vanilla Sky has configured as routes from this origin."""
+    from .config import CITY_IDS, CITY_NAMES
+
+    if origin not in CITY_IDS:
+        return []
+    url = f"{API_BASE}/custom/check-dest/{CITY_IDS[origin]}"
+    try:
+        resp = await client.get(url, timeout=20.0)
+        resp.raise_for_status()
+        dest_ids = resp.json()
+    except (httpx.HTTPError, ValueError) as e:
+        log.warning("[%s] check-dest failed: %s", origin, e)
+        return []
+    return [CITY_NAMES[d] for d in dest_ids if d in CITY_NAMES]
+
+
+async def fetch_route_graph(
+    client: httpx.AsyncClient, origins: tuple[str, ...]
+) -> list[Route]:
+    """For each origin call check-dest, return deduped list of Route pairs."""
+    routes: list[Route] = []
+    seen: set[tuple[str, str]] = set()
+    for origin in origins:
+        dests = await fetch_destinations(client, origin)
+        for dest in dests:
+            key = (origin, dest)
+            if key not in seen:
+                seen.add(key)
+                routes.append(Route(from_name=origin, to_name=dest))
+    return routes
+
+
 async def fetch_form_build_id(client: httpx.AsyncClient) -> str:
     resp = await client.get(TICKETS_URL, timeout=20.0)
     resp.raise_for_status()

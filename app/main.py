@@ -16,6 +16,7 @@ from .poller import (
     _filter_window,
     check_bookable,
     fetch_form_build_id,
+    fetch_route_graph,
     fetch_schedule,
     make_client,
 )
@@ -122,6 +123,30 @@ async def _process_route(
         )
 
 
+async def _build_routes_for_cycle(
+    settings: Settings, client: httpx.AsyncClient
+) -> list[Route]:
+    """Combine monitor_origins (auto-expanded via check-dest graph) with the
+    explicit extra_routes from config. Deduped, stable order."""
+    routes: list[Route] = []
+    seen: set[tuple[str, str]] = set()
+
+    if settings.monitor_origins:
+        for r in await fetch_route_graph(client, settings.monitor_origins):
+            key = (r.from_name, r.to_name)
+            if key not in seen:
+                seen.add(key)
+                routes.append(r)
+
+    for r in settings.extra_routes:
+        key = (r.from_name, r.to_name)
+        if key not in seen:
+            seen.add(key)
+            routes.append(r)
+
+    return routes
+
+
 async def run_one_cycle(
     settings: Settings, db: DB, client: httpx.AsyncClient, tg_client: httpx.AsyncClient
 ) -> None:
@@ -133,7 +158,13 @@ async def run_one_cycle(
         log.error("Couldn't get form_build_id, skipping cycle: %s", e)
         return
 
-    for route in settings.routes:
+    routes = await _build_routes_for_cycle(settings, client)
+    if not routes:
+        log.warning("No routes resolved for this cycle (graph empty?)")
+        return
+    log.info("Cycle starting: %d routes to check", len(routes))
+
+    for route in routes:
         try:
             await _process_route(settings, db, client, tg_client, form_build_id, route)
         except Exception:
@@ -170,8 +201,10 @@ async def main() -> None:
 
     settings = load("/app/config.yml")
     log.info(
-        "Started. routes=%d, interval=%ss, window=[+%dd .. +%dd], passengers=%d",
-        len(settings.routes),
+        "Started. origins=%s, extra_routes=%d, interval=%ss, "
+        "window=[+%dd .. +%dd], passengers=%d",
+        list(settings.monitor_origins),
+        len(settings.extra_routes),
         settings.poll_interval_seconds,
         settings.min_days_ahead,
         settings.lookahead_days,

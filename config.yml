@@ -3,8 +3,14 @@ min_days_ahead: 1
 lookahead_days: 45
 passenger_count: 2
 
-routes:
-  - { from: Natakhtari, to: Mestia }
-  - { from: Mestia,     to: Natakhtari }
-  - { from: Natakhtari, to: Batumi }
-  - { from: Batumi,     to: Natakhtari }
+# For each origin, the bot fetches Vanilla Sky's full route graph at every
+# cycle (via /custom/check-dest/{from_id}) and monitors every destination
+# the operator has configured from this city.
+monitor_origins:
+  - Natakhtari
+  - Mestia
+  - Batumi
+
+# Optional: extra explicit pairs that are not auto-expanded above. Leave
+# empty if monitor_origins covers everything you care about.
+extra_routes: []

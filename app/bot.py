@@ -8,8 +8,8 @@ from pathlib import Path
 
 import httpx
 
-from .config import CITY_IDS, CITY_NAMES, Route, Settings
-from .poller import API_BASE, check_bookable, fetch_form_build_id
+from .config import CITY_IDS, Route, Settings
+from .poller import check_bookable, fetch_destinations, fetch_form_build_id
 
 log = logging.getLogger(__name__)
 
@@ -22,7 +22,8 @@ DATE_FORMATS = ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d.%m.%Y")
 HELP_TEXT = (
     "*Vanilla Sky monitor*\n\n"
     "`/check FROM TO DATE [PAX]` — check a specific route\n"
-    "`/check FROM DATE [PAX]` — scan all destinations from FROM\n\n"
+    "`/check FROM DATE [PAX]` — scan all destinations from FROM\n"
+    "`/routes` — show full Vanilla Sky route graph\n\n"
     "DATE: `DD-MM-YYYY` or `DD/MM/YYYY` (e.g. `31-05-2026`, `31/05/2026`)\n"
     "PAX: 1–9, defaults to 1\n\n"
     "Cities: Tbilisi, Ambrolauri, Batumi, Kutaisi, Mestia, Natakhtari\n"
@@ -154,23 +155,10 @@ async def _scan_destinations(
     pax: int,
 ) -> None:
     iso = flight_date.isoformat()
-    from_id = CITY_IDS[from_canonical]
 
     log.info("[/check scan] %s on %s for %d pax", from_canonical, iso, pax)
 
-    try:
-        resp = await vs_client.get(
-            f"{API_BASE}/custom/check-dest/{from_id}", timeout=20.0
-        )
-        resp.raise_for_status()
-        dest_ids = resp.json()
-    except (httpx.HTTPError, ValueError) as e:
-        await _tg_send(
-            tg_client, settings.bot_token, chat_id, f"❌ Couldn't list destinations: `{e}`"
-        )
-        return
-
-    dest_names = [CITY_NAMES[d] for d in dest_ids if d in CITY_NAMES]
+    dest_names = await fetch_destinations(vs_client, from_canonical)
     if not dest_names:
         await _tg_send(
             tg_client,
@@ -303,6 +291,29 @@ async def _handle_check(
         )
 
 
+async def _handle_routes(
+    settings: Settings,
+    vs_client: httpx.AsyncClient,
+    tg_client: httpx.AsyncClient,
+    chat_id: int,
+) -> None:
+    log.info("[/routes] requested by chat=%s", chat_id)
+
+    lines = ["📍 *Vanilla Sky route graph*", ""]
+    found_any = False
+    for origin in CITY_IDS:
+        dests = await fetch_destinations(vs_client, origin)
+        if dests:
+            found_any = True
+            lines.append(f"*{origin}* → {', '.join(dests)}")
+        await asyncio.sleep(0.3)
+
+    if not found_any:
+        lines = ["❌ Couldn't fetch route graph (API failure)"]
+
+    await _tg_send(tg_client, settings.bot_token, chat_id, "\n".join(lines))
+
+
 async def _process_update(
     settings: Settings,
     vs_client: httpx.AsyncClient,
@@ -331,6 +342,8 @@ async def _process_update(
         await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
     elif cmd == "/check":
         await _handle_check(settings, vs_client, tg_client, chat_id, args)
+    elif cmd == "/routes":
+        await _handle_routes(settings, vs_client, tg_client, chat_id)
     else:
         await _tg_send(
             tg_client, settings.bot_token, chat_id, "Unknown command. Try /help"
