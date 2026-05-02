@@ -33,7 +33,7 @@ def _format_message(
 ) -> str:
     pax_word = "passenger" if passenger_count == 1 else "passengers"
     lines = [
-        f"🎫 *{route.from_name} → {route.to_name}* — TICKETS RELEASED!",
+        f"✈️ *{route.from_name} → {route.to_name}* — TICKETS RELEASED!",
         "",
         f"For *{passenger_count}* {pax_word}:",
     ]
