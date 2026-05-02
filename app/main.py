@@ -4,7 +4,9 @@ import asyncio
 import logging
 import os
 import signal
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -170,7 +172,24 @@ async def run_one_cycle(
         except Exception:
             log.exception("[%s] route processing failed", route.key)
 
-    HEARTBEAT.touch()
+
+def _local_now(tz_name: str) -> datetime:
+    try:
+        return datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        return datetime.now()
+
+
+def _should_skip_cycle(settings: Settings, db: DB) -> str | None:
+    """Return a reason string to skip, or None to proceed."""
+    if db.get_flag("polling_paused"):
+        return "polling is paused (use /resume to start)"
+    if settings.quiet_hours:
+        tz_name = os.environ.get("TZ", "UTC")
+        now_t = _local_now(tz_name).time()
+        if settings.quiet_hours.covers(now_t):
+            return f"quiet hours {settings.quiet_hours.display()} ({tz_name})"
+    return None
 
 
 async def polling_loop(
@@ -183,10 +202,17 @@ async def polling_loop(
     log = logging.getLogger("polling")
     log.info("Polling loop started")
     while not stop.is_set():
-        try:
-            await run_one_cycle(settings, db, vs_client, tg_client)
-        except Exception:
-            log.exception("Cycle failed")
+        skip_reason = _should_skip_cycle(settings, db)
+        if skip_reason:
+            log.info("Skipping cycle: %s", skip_reason)
+        else:
+            try:
+                await run_one_cycle(settings, db, vs_client, tg_client)
+            except Exception:
+                log.exception("Cycle failed")
+
+        # Heartbeat ALWAYS — healthcheck shouldn't fail during pause/quiet.
+        HEARTBEAT.touch()
 
         try:
             await asyncio.wait_for(stop.wait(), timeout=settings.poll_interval_seconds)
@@ -222,7 +248,7 @@ async def main() -> None:
     async with make_client() as vs_client, httpx.AsyncClient() as tg_client:
         await asyncio.gather(
             polling_loop(settings, db, vs_client, tg_client, stop),
-            run_bot(settings, vs_client, tg_client, stop),
+            run_bot(settings, db, vs_client, tg_client, stop),
         )
 
     log.info("Shutting down")

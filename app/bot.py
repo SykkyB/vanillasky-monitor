@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import date, datetime
 from pathlib import Path
 
 import httpx
 
 from .config import CITY_IDS, Route, Settings
+from .db import DB
 from .poller import check_bookable, fetch_destinations, fetch_form_build_id
 
 log = logging.getLogger(__name__)
@@ -21,10 +23,15 @@ DATE_FORMATS = ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d.%m.%Y")
 
 HELP_TEXT = (
     "*Vanilla Sky monitor*\n\n"
+    "*Search:*\n"
     "`/check FROM TO DATE [PAX]` — check a specific route\n"
     "`/check FROM DATE [PAX]` — scan all destinations from FROM\n"
     "`/routes` — show full Vanilla Sky route graph\n\n"
-    "DATE: `DD-MM-YYYY` or `DD/MM/YYYY` (e.g. `31-05-2026`, `31/05/2026`)\n"
+    "*Polling control:*\n"
+    "`/status` — show monitor state\n"
+    "`/pause` — stop background polling (search still works)\n"
+    "`/resume` — start background polling again\n\n"
+    "DATE: `DD-MM-YYYY` or `DD/MM/YYYY` (e.g. `31-05-2026`)\n"
     "PAX: 1–9, defaults to 1\n\n"
     "Cities: Tbilisi, Ambrolauri, Batumi, Kutaisi, Mestia, Natakhtari\n"
     "(prefixes work: `Nat`, `Mes`, `B`, etc.)\n\n"
@@ -291,6 +298,65 @@ async def _handle_check(
         )
 
 
+async def _handle_pause(
+    settings: Settings, db: DB, tg_client: httpx.AsyncClient, chat_id: int
+) -> None:
+    db.set_flag("polling_paused", True)
+    log.info("Polling paused by chat=%s", chat_id)
+    await _tg_send(
+        tg_client,
+        settings.bot_token,
+        chat_id,
+        "⏸️ *Polling paused.*\n\n"
+        "Background checks are stopped. /check and /routes still work.\n"
+        "Use /resume to start polling again.",
+    )
+
+
+async def _handle_resume(
+    settings: Settings, db: DB, tg_client: httpx.AsyncClient, chat_id: int
+) -> None:
+    db.set_flag("polling_paused", False)
+    log.info("Polling resumed by chat=%s", chat_id)
+    await _tg_send(
+        tg_client,
+        settings.bot_token,
+        chat_id,
+        "▶️ *Polling resumed.* Next cycle in ≤5 minutes.",
+    )
+
+
+async def _handle_status(
+    settings: Settings, db: DB, tg_client: httpx.AsyncClient, chat_id: int
+) -> None:
+    paused = db.get_flag("polling_paused")
+    state = "⏸️ *paused*" if paused else "▶️ *active*"
+
+    qh_text = "—"
+    in_quiet_now = False
+    if settings.quiet_hours:
+        qh_text = settings.quiet_hours.display()
+        from .main import _local_now  # local import to avoid circular at top
+
+        tz = os.environ.get("TZ", "UTC")
+        in_quiet_now = settings.quiet_hours.covers(_local_now(tz).time())
+    quiet_marker = " (now)" if in_quiet_now else ""
+
+    origins = ", ".join(settings.monitor_origins) or "—"
+    extras = ", ".join(f"{r.from_name}→{r.to_name}" for r in settings.extra_routes) or "—"
+
+    msg = (
+        f"*Polling:* {state}\n"
+        f"*Quiet hours:* {qh_text}{quiet_marker}\n"
+        f"*Interval:* {settings.poll_interval_seconds}s\n"
+        f"*Window:* +{settings.min_days_ahead}d ... +{settings.lookahead_days}d\n"
+        f"*Default pax:* {settings.passenger_count}\n"
+        f"*Origins:* {origins}\n"
+        f"*Extra routes:* {extras}"
+    )
+    await _tg_send(tg_client, settings.bot_token, chat_id, msg)
+
+
 async def _handle_routes(
     settings: Settings,
     vs_client: httpx.AsyncClient,
@@ -316,6 +382,7 @@ async def _handle_routes(
 
 async def _process_update(
     settings: Settings,
+    db: DB,
     vs_client: httpx.AsyncClient,
     tg_client: httpx.AsyncClient,
     update: dict,
@@ -344,6 +411,12 @@ async def _process_update(
         await _handle_check(settings, vs_client, tg_client, chat_id, args)
     elif cmd == "/routes":
         await _handle_routes(settings, vs_client, tg_client, chat_id)
+    elif cmd == "/pause":
+        await _handle_pause(settings, db, tg_client, chat_id)
+    elif cmd == "/resume":
+        await _handle_resume(settings, db, tg_client, chat_id)
+    elif cmd == "/status":
+        await _handle_status(settings, db, tg_client, chat_id)
     else:
         await _tg_send(
             tg_client, settings.bot_token, chat_id, "Unknown command. Try /help"
@@ -352,6 +425,7 @@ async def _process_update(
 
 async def run_bot(
     settings: Settings,
+    db: DB,
     vs_client: httpx.AsyncClient,
     tg_client: httpx.AsyncClient,
     stop: asyncio.Event,
@@ -390,7 +464,7 @@ async def run_bot(
             offset = max(offset, update["update_id"] + 1)
             _save_offset(offset)
             try:
-                await _process_update(settings, vs_client, tg_client, update)
+                await _process_update(settings, db, vs_client, tg_client, update)
             except Exception:
                 log.exception("Failed to process update %s", update.get("update_id"))
 

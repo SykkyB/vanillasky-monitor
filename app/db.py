@@ -45,6 +45,12 @@ CREATE TABLE IF NOT EXISTS bookable_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_bookable_events_ts ON bookable_events(ts);
+
+-- Tiny key/value store for runtime flags like 'polling_paused'.
+CREATE TABLE IF NOT EXISTS app_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -96,6 +102,21 @@ class DB:
             flight_time=row[2],
             last_check=row[3],
         )
+
+    def get_flag(self, key: str, default: bool = False) -> bool:
+        cur = self.conn.execute("SELECT value FROM app_state WHERE key = ?", (key,))
+        row = cur.fetchone()
+        if row is None:
+            return default
+        return row[0] == "1"
+
+    def set_flag(self, key: str, value: bool) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO app_state(key, value) VALUES (?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (key, "1" if value else "0"),
+            )
 
     def update_bookable_state(
         self,

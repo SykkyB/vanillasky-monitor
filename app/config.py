@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime, time
 from pathlib import Path
 
 import yaml
@@ -37,6 +38,23 @@ class Route:
 
 
 @dataclass(frozen=True)
+class QuietHours:
+    from_time: time
+    to_time: time
+
+    def covers(self, t: time) -> bool:
+        if self.from_time == self.to_time:
+            return False
+        if self.from_time < self.to_time:
+            return self.from_time <= t < self.to_time
+        # Crosses midnight: from=23:00, to=09:00 means [23:00, 24:00) ∪ [00:00, 09:00).
+        return t >= self.from_time or t < self.to_time
+
+    def display(self) -> str:
+        return f"{self.from_time.strftime('%H:%M')}–{self.to_time.strftime('%H:%M')}"
+
+
+@dataclass(frozen=True)
 class Settings:
     poll_interval_seconds: int
     min_days_ahead: int
@@ -44,6 +62,7 @@ class Settings:
     passenger_count: int
     monitor_origins: tuple[str, ...]
     extra_routes: tuple[Route, ...]
+    quiet_hours: QuietHours | None
     bot_token: str
     chat_id: str
 
@@ -67,6 +86,16 @@ def load(config_path: str | Path = "config.yml") -> Settings:
     if not monitor_origins and not extra_routes:
         raise ValueError("Config must define monitor_origins or extra_routes (or both)")
 
+    quiet_hours: QuietHours | None = None
+    qh_raw = raw.get("quiet_hours")
+    if qh_raw and qh_raw.get("from") and qh_raw.get("to"):
+        try:
+            from_t = datetime.strptime(qh_raw["from"], "%H:%M").time()
+            to_t = datetime.strptime(qh_raw["to"], "%H:%M").time()
+            quiet_hours = QuietHours(from_time=from_t, to_time=to_t)
+        except ValueError as e:
+            raise ValueError(f"Invalid quiet_hours format (need HH:MM): {e}") from e
+
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not bot_token or not chat_id:
@@ -79,6 +108,7 @@ def load(config_path: str | Path = "config.yml") -> Settings:
         passenger_count=int(raw.get("passenger_count", 2)),
         monitor_origins=monitor_origins,
         extra_routes=tuple(extra_routes),
+        quiet_hours=quiet_hours,
         bot_token=bot_token,
         chat_id=chat_id,
     )

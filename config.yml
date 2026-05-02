@@ -3,6 +3,14 @@ min_days_ahead: 1
 lookahead_days: 45
 passenger_count: 2
 
+# Quiet hours — bot still runs but skips Vanilla Sky polling. /check still
+# works on demand. Times are in the container's TZ (set via TZ env var).
+# Cross-midnight ranges work (e.g. 23:00 → 09:00 = silent overnight).
+# Set both to the same value to disable, or remove the section entirely.
+quiet_hours:
+  from: "23:00"
+  to: "09:00"
+
 # For each origin, the bot fetches Vanilla Sky's full route graph at every
 # cycle (via /custom/check-dest/{from_id}) and monitors every destination
 # the operator has configured from this city.
