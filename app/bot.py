@@ -33,7 +33,7 @@ HELP_TEXT = (
     "*Search:*\n"
     "`/check FROM TO DATE [PAX]` — check a specific route\n"
     "`/check FROM DATE [PAX]` — scan all destinations on a date\n"
-    "`/check FROM` — show everything on sale from FROM (full window)\n"
+    "`/check FROM [PAX]` — show everything on sale from FROM\n"
     "`/routes` — show full Vanilla Sky route graph\n\n"
     "*Polling control:*\n"
     "`/status` — show monitor state\n"
@@ -49,7 +49,8 @@ HELP_TEXT = (
     "`/check Natakhtari Mestia 31-05-2026`\n"
     "`/check Mes 31.05.2026 3`\n"
     "`/check Natakhtari 31/05/2026`\n"
-    "`/check Natakhtari`"
+    "`/check Natakhtari`\n"
+    "`/check Natakhtari 2`  _← all sale from FROM, 2 pax_"
 )
 
 
@@ -372,7 +373,7 @@ async def _handle_check(
     """Dispatch:
         4 args  → FROM TO DATE PAX
         3 args  → FROM TO DATE (pax=1)  OR  FROM DATE PAX
-        2 args  → FROM DATE (pax=1)
+        2 args  → FROM DATE (pax=1)  OR  FROM PAX (full origin scan with pax)
         1 arg   → FROM only (pax=1, full window scan)
         else    → help
     """
@@ -425,12 +426,21 @@ async def _handle_check(
             await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
             return
     else:  # 2 args
-        to_canonical = None
-        flight_date = _parse_date(args[1])
-        pax = 1
-        if flight_date is None:
+        # Could be FROM DATE (pax=1) or FROM PAX (full origin scan w/ pax).
+        maybe_pax = _parse_pax(args[1])
+        maybe_date = _parse_date(args[1])
+        if maybe_pax is not None:
+            await _scan_origin_full(
+                settings, db, vs_client, tg_client, chat_id,
+                from_canonical, pax=maybe_pax,
+            )
+            return
+        if maybe_date is None:
             await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
             return
+        to_canonical = None
+        flight_date = maybe_date
+        pax = 1
 
     if flight_date < date.today():
         await _tg_send(tg_client, settings.bot_token, chat_id, "❌ Date is in the past")
