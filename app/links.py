@@ -21,12 +21,21 @@ async def is_tunnel_alive(client: httpx.AsyncClient, base_url: str) -> bool:
     return resp.status_code == 200
 
 
-def booking_link(base_url: str, route: Route, flight_date_iso: str, pax: int) -> str:
-    """Construct a deep-link to the redirect service. The redirect service is
-    expected to translate this GET into a POST to ticket.vanillasky.ge with
-    the form pre-filled."""
-    return (
+def booking_link(
+    base_url: str,
+    route: Route,
+    flight_date_iso: str,
+    pax: int,
+    back_date_iso: str | None = None,
+) -> str:
+    """Construct a deep-link to the redirect service. If back_date_iso is
+    provided, the redirect triggers Vanilla Sky's native round-trip mode
+    with both legs pre-filled."""
+    url = (
         f"{base_url}/go"
         f"?from={route.from_id}&to={route.to_id}"
         f"&date={flight_date_iso}&pax={pax}"
     )
+    if back_date_iso:
+        url += f"&back_date={back_date_iso}"
+    return url

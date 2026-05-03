@@ -328,18 +328,14 @@ async def _check_round_trip(
 
     redirect_base = await _resolve_redirect_base(db, settings, vs_client)
 
-    def _leg(label: str, route: Route, dt_iso: str, dt_d: date, result) -> str:
+    def _leg(label: str, route: Route, dt_d: date, result) -> str:
         display = dt_d.strftime("%d-%B-%Y")
         if not result.bookable:
             return (
                 f"❌ *{label}:* {route.from_name} → {route.to_name} "
                 f"on `{display}` — no tickets for {pax} {pax_word}"
             )
-        date_label = f"`{display}`"
-        if redirect_base:
-            link = booking_link(redirect_base, route, dt_iso, pax)
-            date_label = f"[{display}]({link})"
-        bits = [f"✅ *{label}:* {date_label}"]
+        bits = [f"✅ *{label}:* `{display}`"]
         if result.flight_time:
             bits.append(f"🕒 {result.flight_time}")
         priced = format_price(result.price, pax)
@@ -350,8 +346,8 @@ async def _check_round_trip(
     lines = [
         f"🎫 *Round-trip {from_canonical} ↔ {to_canonical}* — *{pax}* {pax_word}",
         "",
-        _leg("Outbound", out_route, out_iso, out_date_d, out_result),
-        _leg("Return  ", back_route, back_iso, back_date_d, back_result),
+        _leg("Outbound", out_route, out_date_d, out_result),
+        _leg("Return  ", back_route, back_date_d, back_result),
     ]
 
     if out_result.bookable and back_result.bookable:
@@ -368,11 +364,27 @@ async def _check_round_trip(
                     f"💰 *Total: {per_pax_total} GEL × {pax} = {grand_total} GEL*"
                 )
 
-    if not redirect_base:
-        lines.append(
-            "\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)"
-        )
-        lines.append("_Outbound and return are booked separately on Vanilla Sky._")
+        # Single combined round-trip booking link
+        if redirect_base:
+            link = booking_link(redirect_base, out_route, out_iso, pax, back_iso)
+            lines.append(f"\n👉 [Book round-trip]({link})")
+        else:
+            lines.append("\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)")
+            lines.append("_Choose round-trip mode on Vanilla Sky and pick the dates above._")
+    elif out_result.bookable or back_result.bookable:
+        # Only one leg available — offer one-way booking for that leg
+        if redirect_base:
+            if out_result.bookable:
+                link = booking_link(redirect_base, out_route, out_iso, pax)
+                lines.append(f"\n👉 [Book outbound only]({link})")
+            else:
+                link = booking_link(redirect_base, back_route, back_iso, pax)
+                lines.append(f"\n👉 [Book return only]({link})")
+        else:
+            lines.append("\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)")
+    else:
+        if not redirect_base:
+            lines.append("\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)")
 
     await _tg_send(tg_client, settings.bot_token, chat_id, "\n".join(lines))
 

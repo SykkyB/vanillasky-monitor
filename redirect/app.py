@@ -88,6 +88,7 @@ async def go(
     to: int = Query(0),
     date: str = Query(""),
     pax: int = Query(1),
+    back_date: str = Query(""),  # optional: triggers native round-trip
 ) -> HTMLResponse:
     # ---- input validation ----
     if from_ < 1 or to < 1:
@@ -105,6 +106,21 @@ async def go(
         raise HTTPException(400, "Invalid 'date'") from None
     display_date = flight_dt.strftime("%d %b %Y")  # e.g. "31 May 2026"
 
+    # Optional return leg → triggers Vanilla Sky's native round-trip mode.
+    types_value = "0"  # one-way
+    back_display = ""
+    if back_date:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", back_date):
+            raise HTTPException(400, "Invalid 'back_date' (need YYYY-MM-DD)")
+        try:
+            back_dt = datetime.strptime(back_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(400, "Invalid 'back_date'") from None
+        if back_dt.date() < flight_dt.date():
+            raise HTTPException(400, "'back_date' must be on or after 'date'")
+        back_display = back_dt.strftime("%d %b %Y")
+        types_value = "1"  # round-trip
+
     # ---- get form_build_id ----
     async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
         try:
@@ -114,6 +130,13 @@ async def go(
             return RedirectResponse(TICKETS_URL, status_code=302)
 
     # ---- render auto-submit HTML ----
+    if back_display:
+        date_caption = f"{display_date} → {back_display}"
+        trip_caption = "round-trip"
+    else:
+        date_caption = display_date
+        trip_caption = "one-way"
+
     html_body = f"""<!doctype html>
 <html lang="en"><head>
   <title>Booking redirect…</title>
@@ -134,16 +157,16 @@ async def go(
 </head><body>
   <div class="spinner"></div>
   <p>Loading Vanilla Sky booking…<br>
-  <small>{escape(display_date)} · {pax} passenger{"s" if pax > 1 else ""}</small></p>
+  <small>{escape(date_caption)} · {trip_caption} · {pax} passenger{"s" if pax > 1 else ""}</small></p>
 
   <form id="f" method="POST"
         action="{escape(TICKETS_URL)}"
         enctype="application/x-www-form-urlencoded">
     <input type="hidden" name="departure" value="{from_}">
     <input type="hidden" name="arrive" value="{to}">
-    <input type="hidden" name="types" value="0">
+    <input type="hidden" name="types" value="{types_value}">
     <input type="hidden" name="date_picker" value="{escape(display_date)}">
-    <input type="hidden" name="date_picker_arrive" value="">
+    <input type="hidden" name="date_picker_arrive" value="{escape(back_display)}">
     <input type="hidden" name="person_count" value="{pax}">
     <input type="hidden" name="person_types[adult]" value="{pax}">
     <input type="hidden" name="person_types[child]" value="0">
