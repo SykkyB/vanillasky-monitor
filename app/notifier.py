@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date
 
@@ -8,6 +9,23 @@ import httpx
 
 from .config import Route
 from .links import booking_link, is_tunnel_alive
+
+_PRICE_NUM_RE = re.compile(r"(\d+)\s*GEL", re.IGNORECASE)
+
+
+def format_price(price_str: str | None, pax: int) -> str | None:
+    """'90 GEL' + pax → display string.
+       pax==1 → '90 GEL (total)' (per-pax equals total)
+       pax>1  → '90 GEL × 2 = 180 GEL'"""
+    if not price_str:
+        return None
+    m = _PRICE_NUM_RE.search(price_str)
+    if not m:
+        return price_str
+    per = int(m.group(1))
+    if pax == 1:
+        return f"{per} GEL (total)"
+    return f"{per} GEL × {pax} = {per * pax} GEL"
 
 log = logging.getLogger(__name__)
 
@@ -49,8 +67,9 @@ def _format_message(
         bits = [date_label]
         if f.flight_time:
             bits.append(f.flight_time)
-        if f.price:
-            bits.append(f"{f.price} (per 1 passenger)")
+        priced = format_price(f.price, passenger_count)
+        if priced:
+            bits.append(priced)
         lines.append("• " + " — ".join(bits))
     lines.append("")
     if redirect_base:

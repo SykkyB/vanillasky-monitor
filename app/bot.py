@@ -12,6 +12,7 @@ import httpx
 from .config import CITY_IDS, Route, Settings
 from .db import DB
 from .links import booking_link, is_tunnel_alive
+from .notifier import format_price
 from .poller import (
     check_bookable,
     fetch_destinations,
@@ -158,8 +159,9 @@ async def _check_one_route(
         ]
         if result.flight_time:
             bits.append(f"🕒 {result.flight_time}")
-        if result.price:
-            bits.append(f"💰 {result.price} (per 1 passenger)")
+        priced = format_price(result.price, pax)
+        if priced:
+            bits.append(f"💰 {priced}")
 
         redirect_base = await _resolve_redirect_base(db, settings, vs_client)
         if redirect_base:
@@ -268,8 +270,9 @@ async def _scan_origin_full(
                 bits = [date_label]
                 if t:
                     bits.append(t)
-                if p:
-                    bits.append(f"{p} (per 1 pax)")
+                priced = format_price(p, pax)
+                if priced:
+                    bits.append(priced)
                 lines.append("  • " + " — ".join(bits))
             lines.append("")
         empty_dests = [d for d in dest_names if not results_by_dest.get(d)]
@@ -347,8 +350,9 @@ async def _scan_destinations(
             bits = [f"→ {dest_label}"]
             if ftime:
                 bits.append(f"🕒 {ftime}")
-            if price:
-                bits.append(f"💰 {price} (per 1 pax)")
+            priced = format_price(price, pax)
+            if priced:
+                bits.append(f"💰 {priced}")
             lines.append("• " + " — ".join(bits))
         if not redirect_base:
             lines.append("\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)")
