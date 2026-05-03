@@ -359,6 +359,7 @@ async def _scan_destinations(
 
 async def _handle_check(
     settings: Settings,
+    db: DB,
     vs_client: httpx.AsyncClient,
     tg_client: httpx.AsyncClient,
     chat_id: int,
@@ -635,7 +636,7 @@ async def _process_update(
     if cmd in ("/start", "/help"):
         await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
     elif cmd == "/check":
-        await _handle_check(settings, vs_client, tg_client, chat_id, args)
+        await _handle_check(settings, db, vs_client, tg_client, chat_id, args)
     elif cmd == "/routes":
         await _handle_routes(settings, vs_client, tg_client, chat_id)
     elif cmd == "/pause":
