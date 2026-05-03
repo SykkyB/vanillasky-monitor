@@ -217,6 +217,12 @@ async def _scan_origin_full(
         return
 
     today = date.today()
+    sem = asyncio.Semaphore(3)  # cap concurrency so we don't hammer the site
+
+    async def _probe(route: Route, d: str):
+        async with sem:
+            return d, await check_bookable(vs_client, form_build_id, route, d, pax)
+
     results_by_dest: dict[str, list[tuple[str, str | None, str | None]]] = {}
     for dest in dest_names:
         route = Route(from_name=from_canonical, to_name=dest)
@@ -226,11 +232,12 @@ async def _scan_origin_full(
             if (parsed := _safe_iso(d)) is not None and parsed >= today
         )
         results_by_dest[dest] = []
-        for d in upcoming:
-            r = await check_bookable(vs_client, form_build_id, route, d, pax)
+        if not upcoming:
+            continue
+        outcomes = await asyncio.gather(*(_probe(route, d) for d in upcoming))
+        for d, r in outcomes:
             if r.bookable:
                 results_by_dest[dest].append((d, r.flight_time, r.price))
-            await asyncio.sleep(0.5)
 
     pax_word = "passenger" if pax == 1 else "passengers"
     have_any = any(v for v in results_by_dest.values())
@@ -586,6 +593,20 @@ async def _handle_routes(
     await _tg_send(tg_client, settings.bot_token, chat_id, "\n".join(lines))
 
 
+async def _process_update_safe(
+    settings: Settings,
+    db: DB,
+    vs_client: httpx.AsyncClient,
+    tg_client: httpx.AsyncClient,
+    update: dict,
+) -> None:
+    """Wrapper so background tasks don't crash silently and exceptions are logged."""
+    try:
+        await _process_update(settings, db, vs_client, tg_client, update)
+    except Exception:
+        log.exception("Failed to process update %s", update.get("update_id"))
+
+
 async def _process_update(
     settings: Settings,
     db: DB,
@@ -673,9 +694,9 @@ async def run_bot(
         for update in data["result"]:
             offset = max(offset, update["update_id"] + 1)
             _save_offset(offset)
-            try:
-                await _process_update(settings, db, vs_client, tg_client, update)
-            except Exception:
-                log.exception("Failed to process update %s", update.get("update_id"))
+            # Fire-and-forget so a long-running /check doesn't block other commands.
+            asyncio.create_task(
+                _process_update_safe(settings, db, vs_client, tg_client, update)
+            )
 
     log.info("Bot listener stopped")
