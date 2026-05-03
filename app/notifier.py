@@ -27,6 +27,14 @@ def format_price(price_str: str | None, pax: int) -> str | None:
         return f"{per} GEL (total)"
     return f"{per} GEL × {pax} = {per * pax} GEL"
 
+
+def extract_gel(price_str: str | None) -> int | None:
+    """Parse '90 GEL' → 90, return None if unparseable or empty."""
+    if not price_str:
+        return None
+    m = _PRICE_NUM_RE.search(price_str)
+    return int(m.group(1)) if m else None
+
 log = logging.getLogger(__name__)
 
 TG_API = "https://api.telegram.org"

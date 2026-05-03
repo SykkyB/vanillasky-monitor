@@ -12,7 +12,7 @@ import httpx
 from .config import CITY_IDS, Route, Settings
 from .db import DB
 from .links import booking_link, is_tunnel_alive
-from .notifier import format_price
+from .notifier import extract_gel, format_price
 from .poller import (
     check_bookable,
     fetch_destinations,
@@ -32,6 +32,7 @@ HELP_TEXT = (
     "*Vanilla Sky monitor*\n\n"
     "*Search:*\n"
     "`/check FROM TO DATE [PAX]` — check a specific route\n"
+    "`/check FROM TO OUT_DATE BACK_DATE [PAX]` — round-trip\n"
     "`/check FROM DATE [PAX]` — scan all destinations on a date\n"
     "`/check FROM [PAX]` — show everything on sale from FROM\n"
     "`/routes` — show full Vanilla Sky route graph\n\n"
@@ -48,6 +49,8 @@ HELP_TEXT = (
     "Examples:\n"
     "`/check Natakhtari Mestia 31-05-2026`\n"
     "`/check Mes 31.05.2026 3`\n"
+    "`/check Natakhtari Mestia 15-05-2026 22-05-2026`  _← round-trip_\n"
+    "`/check Nat Mes 15.05.2026 22.05.2026 2`  _← round-trip, 2 pax_\n"
     "`/check Natakhtari 31/05/2026`\n"
     "`/check Natakhtari`\n"
     "`/check Natakhtari 2`  _← all sale from FROM, 2 pax_"
@@ -177,6 +180,106 @@ async def _check_one_route(
             f"No tickets for *{pax}* {pax_word}."
         )
     await _tg_send(tg_client, settings.bot_token, chat_id, msg)
+
+
+async def _check_round_trip(
+    settings: Settings,
+    db: DB,
+    vs_client: httpx.AsyncClient,
+    tg_client: httpx.AsyncClient,
+    chat_id: int,
+    from_canonical: str,
+    to_canonical: str,
+    out_date_d: date,
+    back_date_d: date,
+    pax: int,
+) -> None:
+    if from_canonical == to_canonical:
+        await _tg_send(tg_client, settings.bot_token, chat_id, "❌ FROM and TO must differ")
+        return
+    if back_date_d < out_date_d:
+        await _tg_send(
+            tg_client,
+            settings.bot_token,
+            chat_id,
+            "❌ Return date must be on or after outbound date",
+        )
+        return
+
+    out_iso = out_date_d.isoformat()
+    back_iso = back_date_d.isoformat()
+    pax_word = "passenger" if pax == 1 else "passengers"
+
+    log.info(
+        "[/check round-trip] %s↔%s out=%s back=%s pax=%d",
+        from_canonical, to_canonical, out_iso, back_iso, pax,
+    )
+
+    try:
+        form_build_id = await fetch_form_build_id(vs_client)
+    except Exception as e:
+        await _tg_send(
+            tg_client, settings.bot_token, chat_id, f"❌ Couldn't get form ID: `{e}`"
+        )
+        return
+
+    out_route = Route(from_name=from_canonical, to_name=to_canonical)
+    back_route = Route(from_name=to_canonical, to_name=from_canonical)
+
+    out_result, back_result = await asyncio.gather(
+        check_bookable(vs_client, form_build_id, out_route, out_iso, pax),
+        check_bookable(vs_client, form_build_id, back_route, back_iso, pax),
+    )
+
+    redirect_base = await _resolve_redirect_base(db, settings, vs_client)
+
+    def _leg(label: str, route: Route, dt_iso: str, dt_d: date, result) -> str:
+        display = dt_d.strftime("%d-%B-%Y")
+        if not result.bookable:
+            return (
+                f"❌ *{label}:* {route.from_name} → {route.to_name} "
+                f"on `{display}` — no tickets for {pax} {pax_word}"
+            )
+        date_label = f"`{display}`"
+        if redirect_base:
+            link = booking_link(redirect_base, route, dt_iso, pax)
+            date_label = f"[{display}]({link})"
+        bits = [f"✅ *{label}:* {date_label}"]
+        if result.flight_time:
+            bits.append(f"🕒 {result.flight_time}")
+        priced = format_price(result.price, pax)
+        if priced:
+            bits.append(f"💰 {priced}")
+        return " — ".join(bits)
+
+    lines = [
+        f"🎫 *Round-trip {from_canonical} ↔ {to_canonical}* — *{pax}* {pax_word}",
+        "",
+        _leg("Outbound", out_route, out_iso, out_date_d, out_result),
+        _leg("Return  ", back_route, back_iso, back_date_d, back_result),
+    ]
+
+    if out_result.bookable and back_result.bookable:
+        out_per = extract_gel(out_result.price)
+        back_per = extract_gel(back_result.price)
+        if out_per is not None and back_per is not None:
+            per_pax_total = out_per + back_per
+            grand_total = per_pax_total * pax
+            lines.append("")
+            if pax == 1:
+                lines.append(f"💰 *Total: {grand_total} GEL*")
+            else:
+                lines.append(
+                    f"💰 *Total: {per_pax_total} GEL × {pax} = {grand_total} GEL*"
+                )
+
+    if not redirect_base:
+        lines.append(
+            "\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)"
+        )
+        lines.append("_Outbound and return are booked separately on Vanilla Sky._")
+
+    await _tg_send(tg_client, settings.bot_token, chat_id, "\n".join(lines))
 
 
 async def _scan_origin_full(
@@ -371,13 +474,14 @@ async def _handle_check(
     args: list[str],
 ) -> None:
     """Dispatch:
-        4 args  → FROM TO DATE PAX
+        5 args  → FROM TO OUT_DATE BACK_DATE PAX  (round-trip)
+        4 args  → FROM TO DATE PAX  OR  FROM TO OUT_DATE BACK_DATE (round-trip pax=1)
         3 args  → FROM TO DATE (pax=1)  OR  FROM DATE PAX
         2 args  → FROM DATE (pax=1)  OR  FROM PAX (full origin scan with pax)
         1 arg   → FROM only (pax=1, full window scan)
         else    → help
     """
-    if len(args) not in (1, 2, 3, 4):
+    if len(args) not in (1, 2, 3, 4, 5):
         await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
         return
 
@@ -397,13 +501,51 @@ async def _handle_check(
         )
         return
 
-    if len(args) == 4:
-        to_canonical = _resolve_city(args[1])
-        flight_date = _parse_date(args[2])
-        pax = _parse_pax(args[3])
-        if not to_canonical or flight_date is None or pax is None:
+    if len(args) == 5:
+        # FROM TO OUT_DATE BACK_DATE PAX (round-trip)
+        to_canonical_rt = _resolve_city(args[1])
+        out_d = _parse_date(args[2])
+        back_d = _parse_date(args[3])
+        pax_rt = _parse_pax(args[4])
+        if not to_canonical_rt or out_d is None or back_d is None or pax_rt is None:
             await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
             return
+        if out_d < date.today():
+            await _tg_send(tg_client, settings.bot_token, chat_id,
+                "❌ Outbound date is in the past")
+            return
+        await _check_round_trip(
+            settings, db, vs_client, tg_client, chat_id,
+            from_canonical, to_canonical_rt, out_d, back_d, pax_rt,
+        )
+        return
+
+    if len(args) == 4:
+        to_canonical = _resolve_city(args[1])
+        if not to_canonical:
+            await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
+            return
+        flight_date = _parse_date(args[2])
+        if flight_date is None:
+            await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
+            return
+        # arg[3] could be PAX (single-direction) or BACK_DATE (round-trip pax=1).
+        maybe_pax = _parse_pax(args[3])
+        maybe_back = _parse_date(args[3])
+        if maybe_back is not None:
+            if flight_date < date.today():
+                await _tg_send(tg_client, settings.bot_token, chat_id,
+                    "❌ Outbound date is in the past")
+                return
+            await _check_round_trip(
+                settings, db, vs_client, tg_client, chat_id,
+                from_canonical, to_canonical, flight_date, maybe_back, pax=1,
+            )
+            return
+        if maybe_pax is None:
+            await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
+            return
+        pax = maybe_pax
     elif len(args) == 3:
         # disambiguate args[1]: city or date?
         maybe_city = _resolve_city(args[1])
