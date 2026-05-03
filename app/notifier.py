@@ -7,6 +7,7 @@ from datetime import date
 import httpx
 
 from .config import Route
+from .links import booking_link, is_tunnel_alive
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +30,10 @@ def _format_date(iso: str) -> str:
 
 
 def _format_message(
-    route: Route, flights: list[ReleasedFlight], passenger_count: int
+    route: Route,
+    flights: list[ReleasedFlight],
+    passenger_count: int,
+    redirect_base: str | None,
 ) -> str:
     pax_word = "passenger" if passenger_count == 1 else "passengers"
     lines = [
@@ -38,15 +42,24 @@ def _format_message(
         f"For *{passenger_count}* {pax_word}:",
     ]
     for f in flights:
-        bits = [f"`{_format_date(f.flight_date)}`"]
+        date_label = f"`{_format_date(f.flight_date)}`"
+        if redirect_base:
+            link = booking_link(redirect_base, route, f.flight_date, passenger_count)
+            date_label = f"[{_format_date(f.flight_date)}]({link})"
+        bits = [date_label]
         if f.flight_time:
             bits.append(f.flight_time)
         if f.price:
-            bits.append(f.price)
+            bits.append(f"{f.price} (per 1 passenger)")
         lines.append("• " + " — ".join(bits))
     lines.append("")
-    lines.append(f"👉 [Open booking page]({BOOK_URL})")
-    lines.append(f"Pick *{route.from_name} → {route.to_name}* and one of the dates above.")
+    if redirect_base:
+        lines.append("Click a date above to open the booking page pre-filled.")
+    else:
+        lines.append(f"👉 [Open booking page]({BOOK_URL})")
+        lines.append(
+            f"Pick *{route.from_name} → {route.to_name}* and one of the dates above."
+        )
     return "\n".join(lines)
 
 
@@ -57,8 +70,17 @@ async def send_alert(
     route: Route,
     flights: list[ReleasedFlight],
     passenger_count: int,
+    redirect_url_base: str,
+    tunnel_enabled: bool,
 ) -> None:
-    text = _format_message(route, flights, passenger_count)
+    redirect_base: str | None = None
+    if tunnel_enabled and redirect_url_base:
+        if await is_tunnel_alive(client, redirect_url_base):
+            redirect_base = redirect_url_base
+        else:
+            log.info("Tunnel enabled but unreachable, falling back to plain links")
+
+    text = _format_message(route, flights, passenger_count, redirect_base)
     url = f"{TG_API}/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,

@@ -63,6 +63,7 @@ class Settings:
     monitor_origins: tuple[str, ...]
     extra_routes: tuple[Route, ...]
     quiet_hours: QuietHours | None
+    redirect_url_base: str
     bot_token: str
     chat_id: str
 
@@ -109,6 +110,7 @@ def load(config_path: str | Path = "config.yml") -> Settings:
         monitor_origins=monitor_origins,
         extra_routes=tuple(extra_routes),
         quiet_hours=quiet_hours,
+        redirect_url_base=str(raw.get("redirect_url_base") or "").rstrip("/"),
         bot_token=bot_token,
         chat_id=chat_id,
     )

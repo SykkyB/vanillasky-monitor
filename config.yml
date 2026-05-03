@@ -11,6 +11,14 @@ quiet_hours:
   from: "23:00"
   to: "09:00"
 
+# Optional: Cloudflare-tunnelled redirect service that auto-submits the
+# Vanilla Sky booking form so Telegram messages can have clickable
+# date links. Leave empty until the redirect service is deployed.
+# Even when set, links are only generated if the bot's `tunnel_enabled`
+# flag is on (toggle via /tunnel_on, /tunnel_off) AND <base>/health
+# returns 200 at the time of the alert.
+redirect_url_base: ""
+
 # For each origin, the bot fetches Vanilla Sky's full route graph at every
 # cycle (via /custom/check-dest/{from_id}) and monitors every destination
 # the operator has configured from this city.

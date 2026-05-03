@@ -11,7 +11,14 @@ import httpx
 
 from .config import CITY_IDS, Route, Settings
 from .db import DB
-from .poller import check_bookable, fetch_destinations, fetch_form_build_id
+from .links import booking_link, is_tunnel_alive
+from .poller import (
+    _filter_window,
+    check_bookable,
+    fetch_destinations,
+    fetch_form_build_id,
+    fetch_schedule,
+)
 
 log = logging.getLogger(__name__)
 
@@ -25,20 +32,24 @@ HELP_TEXT = (
     "*Vanilla Sky monitor*\n\n"
     "*Search:*\n"
     "`/check FROM TO DATE [PAX]` — check a specific route\n"
-    "`/check FROM DATE [PAX]` — scan all destinations from FROM\n"
+    "`/check FROM DATE [PAX]` — scan all destinations on a date\n"
+    "`/check FROM` — show everything on sale from FROM (full window)\n"
     "`/routes` — show full Vanilla Sky route graph\n\n"
     "*Polling control:*\n"
     "`/status` — show monitor state\n"
     "`/pause` — stop background polling (search still works)\n"
-    "`/resume` — start background polling again\n\n"
-    "DATE: `DD-MM-YYYY` or `DD/MM/YYYY` (e.g. `31-05-2026`)\n"
+    "`/resume` — start background polling again\n"
+    "`/tunnel_on`, `/tunnel_off` — toggle clickable booking links\n\n"
+    "DATE: `DD-MM-YYYY`, `DD/MM/YYYY`, `DD.MM.YYYY` "
+    "(e.g. `31-05-2026`, `31/05/2026`, `31.05.2026`)\n"
     "PAX: 1–9, defaults to 1\n\n"
     "Cities: Tbilisi, Ambrolauri, Batumi, Kutaisi, Mestia, Natakhtari\n"
     "(prefixes work: `Nat`, `Mes`, `B`, etc.)\n\n"
     "Examples:\n"
     "`/check Natakhtari Mestia 31-05-2026`\n"
-    "`/check Mes 31/05/2026 3`\n"
-    "`/check Natakhtari 31-05-2026`"
+    "`/check Mes 31.05.2026 3`\n"
+    "`/check Natakhtari 31/05/2026`\n"
+    "`/check Natakhtari`"
 )
 
 
@@ -103,6 +114,7 @@ async def _tg_send(
 
 async def _check_one_route(
     settings: Settings,
+    db: DB,
     vs_client: httpx.AsyncClient,
     tg_client: httpx.AsyncClient,
     chat_id: int,
@@ -141,8 +153,14 @@ async def _check_one_route(
         if result.flight_time:
             bits.append(f"🕒 {result.flight_time}")
         if result.price:
-            bits.append(f"💰 {result.price}")
-        bits.append("\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)")
+            bits.append(f"💰 {result.price} (per 1 passenger)")
+
+        redirect_base = await _resolve_redirect_base(db, settings, vs_client)
+        if redirect_base:
+            link = booking_link(redirect_base, route, iso, pax)
+            bits.append(f"\n👉 [Book this flight]({link})")
+        else:
+            bits.append("\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)")
         msg = "\n".join(bits)
     else:
         msg = (
@@ -152,8 +170,111 @@ async def _check_one_route(
     await _tg_send(tg_client, settings.bot_token, chat_id, msg)
 
 
+async def _scan_origin_full(
+    settings: Settings,
+    db: DB,
+    vs_client: httpx.AsyncClient,
+    tg_client: httpx.AsyncClient,
+    chat_id: int,
+    from_canonical: str,
+    pax: int,
+) -> None:
+    """No date — scan all destinations from FROM across the entire window."""
+    log.info(
+        "[/check origin-full] %s for %d pax (window +%dd .. +%dd)",
+        from_canonical,
+        pax,
+        settings.min_days_ahead,
+        settings.lookahead_days,
+    )
+
+    dest_names = await fetch_destinations(vs_client, from_canonical)
+    if not dest_names:
+        await _tg_send(
+            tg_client,
+            settings.bot_token,
+            chat_id,
+            f"No flights configured from *{from_canonical}*",
+        )
+        return
+
+    await _tg_send(
+        tg_client,
+        settings.bot_token,
+        chat_id,
+        f"🔎 Scanning {len(dest_names)} destinations from *{from_canonical}* "
+        f"(window +{settings.min_days_ahead}d ... +{settings.lookahead_days}d), "
+        "this may take a minute…",
+    )
+
+    try:
+        form_build_id = await fetch_form_build_id(vs_client)
+    except Exception as e:
+        await _tg_send(
+            tg_client, settings.bot_token, chat_id, f"❌ Couldn't get form ID: `{e}`"
+        )
+        return
+
+    results_by_dest: dict[str, list[tuple[str, str | None, str | None]]] = {}
+    for dest in dest_names:
+        route = Route(from_name=from_canonical, to_name=dest)
+        schedule = await fetch_schedule(vs_client, route)
+        in_window = _filter_window(
+            schedule, settings.min_days_ahead, settings.lookahead_days
+        )
+        results_by_dest[dest] = []
+        for d in in_window:
+            r = await check_bookable(vs_client, form_build_id, route, d, pax)
+            if r.bookable:
+                results_by_dest[dest].append((d, r.flight_time, r.price))
+            await asyncio.sleep(0.5)
+
+    pax_word = "passenger" if pax == 1 else "passengers"
+    have_any = any(v for v in results_by_dest.values())
+
+    if not have_any:
+        msg = (
+            f"❌ Nothing on sale from *{from_canonical}* in the next "
+            f"{settings.lookahead_days} days for *{pax}* {pax_word}."
+        )
+    else:
+        redirect_base = await _resolve_redirect_base(db, settings, vs_client)
+        lines = [
+            f"✅ *From {from_canonical}* — currently on sale for *{pax}* {pax_word}:",
+            "",
+        ]
+        for dest in dest_names:
+            available = results_by_dest.get(dest, [])
+            if not available:
+                continue
+            lines.append(f"*→ {dest}* ({len(available)})")
+            route = Route(from_name=from_canonical, to_name=dest)
+            for d, t, p in available:
+                date_label = f"`{date.fromisoformat(d).strftime('%d-%B-%Y')}`"
+                if redirect_base:
+                    pretty = date.fromisoformat(d).strftime("%d-%B-%Y")
+                    link = booking_link(redirect_base, route, d, pax)
+                    date_label = f"[{pretty}]({link})"
+                bits = [date_label]
+                if t:
+                    bits.append(t)
+                if p:
+                    bits.append(f"{p} (per 1 pax)")
+                lines.append("  • " + " — ".join(bits))
+            lines.append("")
+        empty_dests = [d for d in dest_names if not results_by_dest.get(d)]
+        if empty_dests:
+            lines.append(f"_Empty: {', '.join(empty_dests)}_")
+        if not redirect_base:
+            lines.append("\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)")
+        msg = "\n".join(lines)
+
+    await _tg_send(tg_client, settings.bot_token, chat_id, msg)
+
+
 async def _scan_destinations(
     settings: Settings,
+    db: DB,
     vs_client: httpx.AsyncClient,
     tg_client: httpx.AsyncClient,
     chat_id: int,
@@ -202,18 +323,25 @@ async def _scan_destinations(
             f"Checked: {checked}"
         )
     else:
+        redirect_base = await _resolve_redirect_base(db, settings, vs_client)
         lines = [
             f"✅ From *{from_canonical}* on `{display_date}` for *{pax}* {pax_word}:",
             "",
         ]
         for dest, ftime, price in available:
-            bits = [f"→ *{dest}*"]
+            dest_label = f"*{dest}*"
+            if redirect_base:
+                route = Route(from_name=from_canonical, to_name=dest)
+                link = booking_link(redirect_base, route, iso, pax)
+                dest_label = f"[*{dest}*]({link})"
+            bits = [f"→ {dest_label}"]
             if ftime:
                 bits.append(f"🕒 {ftime}")
             if price:
-                bits.append(f"💰 {price}")
+                bits.append(f"💰 {price} (per 1 pax)")
             lines.append("• " + " — ".join(bits))
-        lines.append("\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)")
+        if not redirect_base:
+            lines.append("\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)")
         msg = "\n".join(lines)
 
     await _tg_send(tg_client, settings.bot_token, chat_id, msg)
@@ -230,9 +358,10 @@ async def _handle_check(
         4 args  → FROM TO DATE PAX
         3 args  → FROM TO DATE (pax=1)  OR  FROM DATE PAX
         2 args  → FROM DATE (pax=1)
+        1 arg   → FROM only (pax=1, full window scan)
         else    → help
     """
-    if len(args) not in (2, 3, 4):
+    if len(args) not in (1, 2, 3, 4):
         await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
         return
 
@@ -243,6 +372,12 @@ async def _handle_check(
             settings.bot_token,
             chat_id,
             f"❌ Unknown FROM `{args[0]}`. Known: {', '.join(CITY_IDS)}",
+        )
+        return
+
+    if len(args) == 1:
+        await _scan_origin_full(
+            settings, db, vs_client, tg_client, chat_id, from_canonical, pax=1
         )
         return
 
@@ -288,14 +423,67 @@ async def _handle_check(
 
     if to_canonical:
         await _check_one_route(
-            settings, vs_client, tg_client, chat_id,
+            settings, db, vs_client, tg_client, chat_id,
             from_canonical, to_canonical, flight_date, pax,
         )
     else:
         await _scan_destinations(
-            settings, vs_client, tg_client, chat_id,
+            settings, db, vs_client, tg_client, chat_id,
             from_canonical, flight_date, pax,
         )
+
+
+async def _resolve_redirect_base(
+    db: DB, settings: Settings, client: httpx.AsyncClient
+) -> str | None:
+    """Return base URL for booking links, or None if tunnel is disabled/unreachable."""
+    if not db.get_flag("tunnel_enabled"):
+        return None
+    if not settings.redirect_url_base:
+        return None
+    if not await is_tunnel_alive(client, settings.redirect_url_base):
+        return None
+    return settings.redirect_url_base
+
+
+async def _handle_tunnel_on(
+    settings: Settings,
+    db: DB,
+    vs_client: httpx.AsyncClient,
+    tg_client: httpx.AsyncClient,
+    chat_id: int,
+) -> None:
+    db.set_flag("tunnel_enabled", True)
+    if not settings.redirect_url_base:
+        msg = (
+            "🌐 *Tunnel mode enabled.*\n\n"
+            "But `redirect_url_base` is not configured in `config.yml`. "
+            "Until you set it, alerts will still use plain text. "
+            "Once you deploy the redirect service, add its URL to "
+            "`redirect_url_base` and links will appear automatically."
+        )
+    else:
+        alive = await is_tunnel_alive(vs_client, settings.redirect_url_base)
+        marker = "✅ reachable now" if alive else "⚠️ NOT reachable now"
+        msg = (
+            f"🌐 *Tunnel mode enabled.*\n\n"
+            f"Base: `{settings.redirect_url_base}` — {marker}\n\n"
+            "Each alert will probe the tunnel and use clickable links if alive, "
+            "or plain text if down."
+        )
+    await _tg_send(tg_client, settings.bot_token, chat_id, msg)
+
+
+async def _handle_tunnel_off(
+    settings: Settings, db: DB, tg_client: httpx.AsyncClient, chat_id: int
+) -> None:
+    db.set_flag("tunnel_enabled", False)
+    await _tg_send(
+        tg_client,
+        settings.bot_token,
+        chat_id,
+        "🚫 *Tunnel mode disabled.* Alerts will use plain-text format.",
+    )
 
 
 async def _handle_pause(
@@ -327,7 +515,11 @@ async def _handle_resume(
 
 
 async def _handle_status(
-    settings: Settings, db: DB, tg_client: httpx.AsyncClient, chat_id: int
+    settings: Settings,
+    db: DB,
+    vs_client: httpx.AsyncClient,
+    tg_client: httpx.AsyncClient,
+    chat_id: int,
 ) -> None:
     paused = db.get_flag("polling_paused")
     state = "⏸️ *paused*" if paused else "▶️ *active*"
@@ -342,6 +534,16 @@ async def _handle_status(
         in_quiet_now = settings.quiet_hours.covers(_local_now(tz).time())
     quiet_marker = " (now)" if in_quiet_now else ""
 
+    tunnel_enabled = db.get_flag("tunnel_enabled")
+    if not settings.redirect_url_base:
+        tunnel_text = "—  _(redirect_url_base not set in config)_"
+    elif not tunnel_enabled:
+        tunnel_text = f"🚫 disabled (`{settings.redirect_url_base}`)"
+    else:
+        alive = await is_tunnel_alive(vs_client, settings.redirect_url_base)
+        mark = "✅ reachable" if alive else "⚠️ unreachable"
+        tunnel_text = f"🌐 enabled — {mark} (`{settings.redirect_url_base}`)"
+
     origins = ", ".join(settings.monitor_origins) or "—"
     extras = ", ".join(f"{r.from_name}→{r.to_name}" for r in settings.extra_routes) or "—"
 
@@ -351,6 +553,7 @@ async def _handle_status(
         f"*Interval:* {settings.poll_interval_seconds}s\n"
         f"*Window:* +{settings.min_days_ahead}d ... +{settings.lookahead_days}d\n"
         f"*Default pax:* {settings.passenger_count}\n"
+        f"*Tunnel links:* {tunnel_text}\n"
         f"*Origins:* {origins}\n"
         f"*Extra routes:* {extras}"
     )
@@ -416,7 +619,11 @@ async def _process_update(
     elif cmd == "/resume":
         await _handle_resume(settings, db, tg_client, chat_id)
     elif cmd == "/status":
-        await _handle_status(settings, db, tg_client, chat_id)
+        await _handle_status(settings, db, vs_client, tg_client, chat_id)
+    elif cmd == "/tunnel_on":
+        await _handle_tunnel_on(settings, db, vs_client, tg_client, chat_id)
+    elif cmd == "/tunnel_off":
+        await _handle_tunnel_off(settings, db, tg_client, chat_id)
     else:
         await _tg_send(
             tg_client, settings.bot_token, chat_id, "Unknown command. Try /help"

@@ -122,6 +122,8 @@ async def _process_route(
             route,
             newly_released,
             settings.passenger_count,
+            settings.redirect_url_base,
+            db.get_flag("tunnel_enabled"),
         )
 
 
