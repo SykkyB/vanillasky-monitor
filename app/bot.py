@@ -13,7 +13,6 @@ from .config import CITY_IDS, Route, Settings
 from .db import DB
 from .links import booking_link, is_tunnel_alive
 from .poller import (
-    _filter_window,
     check_bookable,
     fetch_destinations,
     fetch_form_build_id,
@@ -72,6 +71,13 @@ def _parse_date(s: str) -> date | None:
         except ValueError:
             continue
     return None
+
+
+def _safe_iso(s: str) -> date | None:
+    try:
+        return date.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
 
 
 def _resolve_city(arg: str) -> str | None:
@@ -179,14 +185,10 @@ async def _scan_origin_full(
     from_canonical: str,
     pax: int,
 ) -> None:
-    """No date — scan all destinations from FROM across the entire window."""
-    log.info(
-        "[/check origin-full] %s for %d pax (window +%dd .. +%dd)",
-        from_canonical,
-        pax,
-        settings.min_days_ahead,
-        settings.lookahead_days,
-    )
+    """No date — scan all destinations from FROM across every date Vanilla Sky
+    currently has scheduled. Ignores min_days_ahead / lookahead_days; only
+    drops dates that are in the past."""
+    log.info("[/check origin-full] %s for %d pax (no window)", from_canonical, pax)
 
     dest_names = await fetch_destinations(vs_client, from_canonical)
     if not dest_names:
@@ -202,9 +204,8 @@ async def _scan_origin_full(
         tg_client,
         settings.bot_token,
         chat_id,
-        f"🔎 Scanning {len(dest_names)} destinations from *{from_canonical}* "
-        f"(window +{settings.min_days_ahead}d ... +{settings.lookahead_days}d), "
-        "this may take a minute…",
+        f"🔎 Scanning *every scheduled date* across {len(dest_names)} "
+        f"destinations from *{from_canonical}*, this may take a minute…",
     )
 
     try:
@@ -215,15 +216,17 @@ async def _scan_origin_full(
         )
         return
 
+    today = date.today()
     results_by_dest: dict[str, list[tuple[str, str | None, str | None]]] = {}
     for dest in dest_names:
         route = Route(from_name=from_canonical, to_name=dest)
         schedule = await fetch_schedule(vs_client, route)
-        in_window = _filter_window(
-            schedule, settings.min_days_ahead, settings.lookahead_days
+        upcoming = sorted(
+            d for d in schedule
+            if (parsed := _safe_iso(d)) is not None and parsed >= today
         )
         results_by_dest[dest] = []
-        for d in in_window:
+        for d in upcoming:
             r = await check_bookable(vs_client, form_build_id, route, d, pax)
             if r.bookable:
                 results_by_dest[dest].append((d, r.flight_time, r.price))
@@ -234,8 +237,8 @@ async def _scan_origin_full(
 
     if not have_any:
         msg = (
-            f"❌ Nothing on sale from *{from_canonical}* in the next "
-            f"{settings.lookahead_days} days for *{pax}* {pax_word}."
+            f"❌ Nothing on sale from *{from_canonical}* right now "
+            f"for *{pax}* {pax_word}."
         )
     else:
         redirect_base = await _resolve_redirect_base(db, settings, vs_client)
