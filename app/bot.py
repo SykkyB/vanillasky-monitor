@@ -33,6 +33,7 @@ HELP_TEXT = (
     "*Search:*\n"
     "`/check FROM TO DATE [PAX]` — check a specific route\n"
     "`/check FROM TO OUT_DATE BACK_DATE [PAX]` — round-trip\n"
+    "`/check FROM TO [PAX]` — all dates this route is on sale\n"
     "`/check FROM DATE [PAX]` — scan all destinations on a date\n"
     "`/check FROM [PAX]` — show everything on sale from FROM\n"
     "`/routes` — show full Vanilla Sky route graph\n\n"
@@ -51,6 +52,8 @@ HELP_TEXT = (
     "`/check Mes 31.05.2026 3`\n"
     "`/check Natakhtari Mestia 15-05-2026 22-05-2026`  _← round-trip_\n"
     "`/check Nat Mes 15.05.2026 22.05.2026 2`  _← round-trip, 2 pax_\n"
+    "`/check Natakhtari Mestia`  _← all dates this route is on sale_\n"
+    "`/check Nat Mes 2`  _← same, but for 2 pax_\n"
     "`/check Natakhtari 31/05/2026`\n"
     "`/check Natakhtari`\n"
     "`/check Natakhtari 2`  _← all sale from FROM, 2 pax_"
@@ -179,6 +182,97 @@ async def _check_one_route(
             f"❌ *{from_canonical} → {to_canonical}* — `{display_date}`\n"
             f"No tickets for *{pax}* {pax_word}."
         )
+    await _tg_send(tg_client, settings.bot_token, chat_id, msg)
+
+
+async def _scan_route_full(
+    settings: Settings,
+    db: DB,
+    vs_client: httpx.AsyncClient,
+    tg_client: httpx.AsyncClient,
+    chat_id: int,
+    from_canonical: str,
+    to_canonical: str,
+    pax: int,
+) -> None:
+    """No date — show every date on which FROM→TO is currently bookable."""
+    if from_canonical == to_canonical:
+        await _tg_send(tg_client, settings.bot_token, chat_id, "❌ FROM and TO must differ")
+        return
+
+    pax_word = "passenger" if pax == 1 else "passengers"
+    log.info(
+        "[/check route-full] %s -> %s pax=%d", from_canonical, to_canonical, pax
+    )
+
+    route = Route(from_name=from_canonical, to_name=to_canonical)
+    schedule = await fetch_schedule(vs_client, route)
+    today = date.today()
+    upcoming = sorted(
+        d for d in schedule
+        if (parsed := _safe_iso(d)) is not None and parsed >= today
+    )
+
+    if not upcoming:
+        await _tg_send(
+            tg_client, settings.bot_token, chat_id,
+            f"❌ No scheduled flights *{from_canonical} → {to_canonical}* "
+            "in Vanilla Sky's calendar right now.",
+        )
+        return
+
+    await _tg_send(
+        tg_client, settings.bot_token, chat_id,
+        f"🔎 Checking {len(upcoming)} scheduled dates "
+        f"for *{from_canonical} → {to_canonical}*…",
+    )
+
+    try:
+        form_build_id = await fetch_form_build_id(vs_client)
+    except Exception as e:
+        await _tg_send(
+            tg_client, settings.bot_token, chat_id, f"❌ Couldn't get form ID: `{e}`"
+        )
+        return
+
+    sem = asyncio.Semaphore(3)
+
+    async def _probe(d: str):
+        async with sem:
+            return d, await check_bookable(vs_client, form_build_id, route, d, pax)
+
+    outcomes = await asyncio.gather(*(_probe(d) for d in upcoming))
+    available = [(d, r.flight_time, r.price) for d, r in outcomes if r.bookable]
+
+    if not available:
+        msg = (
+            f"❌ Nothing on sale *{from_canonical} → {to_canonical}* "
+            f"for *{pax}* {pax_word} right now."
+        )
+    else:
+        redirect_base = await _resolve_redirect_base(db, settings, vs_client)
+        lines = [
+            f"✅ *{from_canonical} → {to_canonical}* — currently on sale "
+            f"for *{pax}* {pax_word}:",
+            "",
+        ]
+        for d, t, p in available:
+            display = date.fromisoformat(d).strftime("%d-%B-%Y")
+            date_label = f"`{display}`"
+            if redirect_base:
+                link = booking_link(redirect_base, route, d, pax)
+                date_label = f"[{display}]({link})"
+            bits = [date_label]
+            if t:
+                bits.append(t)
+            priced = format_price(p, pax)
+            if priced:
+                bits.append(priced)
+            lines.append("• " + " — ".join(bits))
+        if not redirect_base:
+            lines.append("\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)")
+        msg = "\n".join(lines)
+
     await _tg_send(tg_client, settings.bot_token, chat_id, msg)
 
 
@@ -547,14 +641,23 @@ async def _handle_check(
             return
         pax = maybe_pax
     elif len(args) == 3:
-        # disambiguate args[1]: city or date?
+        # FROM TO DATE (pax=1), FROM DATE PAX, or FROM TO PAX (route-full scan).
         maybe_city = _resolve_city(args[1])
         maybe_date = _parse_date(args[1])
         if maybe_city:
-            to_canonical = maybe_city
-            flight_date = _parse_date(args[2])
-            pax = 1
-            if flight_date is None:
+            arg2_date = _parse_date(args[2])
+            arg2_pax = _parse_pax(args[2])
+            if arg2_date is not None:
+                to_canonical = maybe_city
+                flight_date = arg2_date
+                pax = 1
+            elif arg2_pax is not None:
+                await _scan_route_full(
+                    settings, db, vs_client, tg_client, chat_id,
+                    from_canonical, maybe_city, pax=arg2_pax,
+                )
+                return
+            else:
                 await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
                 return
         elif maybe_date:
@@ -568,21 +671,29 @@ async def _handle_check(
             await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
             return
     else:  # 2 args
-        # Could be FROM DATE (pax=1) or FROM PAX (full origin scan w/ pax).
+        # Three forms: FROM PAX, FROM DATE, FROM TO.
         maybe_pax = _parse_pax(args[1])
         maybe_date = _parse_date(args[1])
+        maybe_city = _resolve_city(args[1])
         if maybe_pax is not None:
             await _scan_origin_full(
                 settings, db, vs_client, tg_client, chat_id,
                 from_canonical, pax=maybe_pax,
             )
             return
-        if maybe_date is None:
+        if maybe_date is not None:
+            to_canonical = None
+            flight_date = maybe_date
+            pax = 1
+        elif maybe_city is not None:
+            await _scan_route_full(
+                settings, db, vs_client, tg_client, chat_id,
+                from_canonical, maybe_city, pax=1,
+            )
+            return
+        else:
             await _tg_send(tg_client, settings.bot_token, chat_id, HELP_TEXT)
             return
-        to_canonical = None
-        flight_date = maybe_date
-        pax = 1
 
     if flight_date < date.today():
         await _tg_send(tg_client, settings.bot_token, chat_id, "❌ Date is in the past")
