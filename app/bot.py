@@ -160,8 +160,15 @@ async def _check_one_route(
     pax_word = "passenger" if pax == 1 else "passengers"
 
     if result.bookable:
+        redirect_base = await _resolve_redirect_base(db, settings, vs_client)
+        if redirect_base:
+            link = booking_link(redirect_base, route, iso, pax)
+            date_label = f"[{display_date}]({link})"
+        else:
+            date_label = f"`{display_date}`"
+
         bits = [
-            f"✅ *{from_canonical} → {to_canonical}* — `{display_date}`",
+            f"✅ *{from_canonical} → {to_canonical}* — {date_label}",
             f"Available for *{pax}* {pax_word}",
         ]
         if result.flight_time:
@@ -170,11 +177,7 @@ async def _check_one_route(
         if priced:
             bits.append(f"💰 {priced}")
 
-        redirect_base = await _resolve_redirect_base(db, settings, vs_client)
-        if redirect_base:
-            link = booking_link(redirect_base, route, iso, pax)
-            bits.append(f"\n👉 [Book this flight]({link})")
-        else:
+        if not redirect_base:
             bits.append("\n👉 [Open booking page](https://ticket.vanillasky.ge/en/tickets)")
         msg = "\n".join(bits)
     else:
