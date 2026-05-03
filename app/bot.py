@@ -320,10 +320,11 @@ async def _check_round_trip(
     out_route = Route(from_name=from_canonical, to_name=to_canonical)
     back_route = Route(from_name=to_canonical, to_name=from_canonical)
 
-    out_result, back_result = await asyncio.gather(
-        check_bookable(vs_client, form_build_id, out_route, out_iso, pax),
-        check_bookable(vs_client, form_build_id, back_route, back_iso, pax),
-    )
+    # Run sequentially: parallel POSTs with the same form_build_id seem to
+    # confuse Drupal's session/form state and both come back as "no tickets"
+    # even when the dates are individually bookable.
+    out_result = await check_bookable(vs_client, form_build_id, out_route, out_iso, pax)
+    back_result = await check_bookable(vs_client, form_build_id, back_route, back_iso, pax)
 
     redirect_base = await _resolve_redirect_base(db, settings, vs_client)
 
